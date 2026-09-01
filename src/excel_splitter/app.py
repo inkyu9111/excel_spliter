@@ -3,13 +3,14 @@ from __future__ import annotations
 import tkinter as tk
 
 from .controller import AppController
+from .excel_gateway import ExcelComGateway
 from .gui import ExcelSplitterGui
 from .ports import SplitServicePort
+from .split_service import SplitService
 
 
 def main(service: SplitServicePort | None = None) -> None:
-    if service is None:
-        raise RuntimeError("SplitService wiring is pending")
+    concrete = service or SplitService(ExcelComGateway())
     root = tk.Tk()
-    ExcelSplitterGui(root, AppController(service))
+    ExcelSplitterGui(root, AppController(concrete))
     root.mainloop()

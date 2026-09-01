@@ -18,13 +18,26 @@ from excel_splitter.models import (
 )
 
 
-def test_script_entry_reaches_temporary_composition_error() -> None:
+def test_script_entry_calls_main_without_requiring_package_context() -> None:
     project_root = Path(__file__).parents[2]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(project_root / "src")
+    probe = "\n".join(
+        (
+            "import runpy, sys, types",
+            "import excel_splitter",
+            "calls = []",
+            "stub = types.ModuleType('excel_splitter.app')",
+            "stub.main = lambda: calls.append('called')",
+            "sys.modules['excel_splitter.app'] = stub",
+            "excel_splitter.app = stub",
+            "runpy.run_path('src/excel_splitter/__main__.py', run_name='__main__')",
+            "assert calls == ['called'], calls",
+        )
+    )
 
     completed = subprocess.run(
-        [sys.executable, "src/excel_splitter/__main__.py"],
+        [sys.executable, "-c", probe],
         cwd=project_root,
         env=environment,
         capture_output=True,
@@ -32,8 +45,7 @@ def test_script_entry_reaches_temporary_composition_error() -> None:
         check=False,
     )
 
-    assert completed.returncode != 0
-    assert "SplitService wiring is pending" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
     assert "attempted relative import" not in completed.stderr
 
 
