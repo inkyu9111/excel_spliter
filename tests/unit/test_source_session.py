@@ -342,6 +342,7 @@ def test_save_plain_master_uses_safe_options_and_reopens_for_identity_check(
         path = Path(filename)
         save_calls.append((path, options, threading.get_ident()))
         write_minimal_xlsx(path)
+        source_workbook.FullName = str(path)
 
     source_workbook.SaveAs = save_as
     source_closed = False
@@ -387,7 +388,7 @@ def test_save_plain_master_uses_safe_options_and_reopens_for_identity_check(
     assert [name for name, _ in events].count("close") == 2
 
 
-def test_snapshot_flags_artifacts_and_plain_master_cleans_them_after_save_as(
+def test_plain_master_verifies_matching_full_name_before_artifact_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.xlsx"
@@ -402,7 +403,9 @@ def test_snapshot_flags_artifacts_and_plain_master_cleans_them_after_save_as(
 
     def save_as(filename: str, **_options: object) -> None:
         sequence.append("save-as")
-        write_minimal_xlsx(Path(filename))
+        master = Path(filename)
+        write_minimal_xlsx(master)
+        source_workbook.FullName = str(master).swapcase()
 
     source_workbook.SaveAs = save_as
     source_workbook.Save = lambda: sequence.append("save")
@@ -430,6 +433,60 @@ def test_snapshot_flags_artifacts_and_plain_master_cleans_them_after_save_as(
     assert sequence == ["save-as", "delete", "save"]
 
 
+@pytest.mark.parametrize("full_name_failure", ["mismatch", "unreadable"])
+def test_plain_master_rejects_untrusted_full_name_before_artifact_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full_name_failure: str,
+) -> None:
+    source = tmp_path / "source.xlsx"
+    source_bytes = b"source"
+    source.write_bytes(source_bytes)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    events: list[tuple[str, int]] = []
+    source_workbook = Workbook(events)
+    source_workbook.sheet.Comments.Count = 1
+    mutations: list[str] = []
+
+    def save_as(filename: str, **_options: object) -> None:
+        write_minimal_xlsx(Path(filename))
+        if full_name_failure == "mismatch":
+            source_workbook.FullName = str(run_dir / "wrong.xlsx")
+
+    source_workbook.SaveAs = save_as
+    source_workbook.Save = lambda: mutations.append("save")
+    monkeypatch.setattr(
+        "excel_splitter.source_session.delete_removable_artifacts",
+        lambda _sheet: mutations.append("delete"),
+    )
+    if full_name_failure == "unreadable":
+        monkeypatch.setattr(
+            Workbook,
+            "FullName",
+            property(
+                lambda _self: (_ for _ in ()).throw(RuntimeError("unreadable"))
+            ),
+            raising=False,
+        )
+
+    excel = Excel(events, lambda _path: source_workbook)
+    session = SourceSession(session_factory=session_factory_for(excel, events))
+    session.start()
+    session.open_source(source)
+    snapshot = session.build_snapshot("Data", "Team")
+    try:
+        with pytest.raises(SplitExecutionError, match="master"):
+            session.save_plain_master(run_dir, snapshot)
+
+        assert mutations == []
+        assert source.read_bytes() == source_bytes
+        assert tuple(run_dir.iterdir()) == ()
+        assert [name for name, _ in events].count("close") == 1
+    finally:
+        session.shutdown()
+
+
 @pytest.mark.parametrize("failure", ["package", "identity"])
 def test_save_plain_master_deletes_partial_output_on_verification_failure(
     tmp_path: Path, failure: str
@@ -445,6 +502,7 @@ def test_save_plain_master_deletes_partial_output_on_verification_failure(
     )
 
     def save_as(filename: str, **_options: object) -> None:
+        source_workbook.FullName = filename
         if failure == "package":
             Path(filename).write_bytes(b"not a zip")
         else:
@@ -475,7 +533,12 @@ def test_save_plain_master_reports_plaintext_path_when_unlink_fails(
     run_dir.mkdir()
     events: list[tuple[str, int]] = []
     workbook = Workbook(events)
-    workbook.SaveAs = lambda filename, **_options: Path(filename).write_bytes(b"plain")
+
+    def save_as(filename: str, **_options: object) -> None:
+        Path(filename).write_bytes(b"plain")
+        workbook.FullName = filename
+
+    workbook.SaveAs = save_as
     excel = Excel(events, lambda _path: workbook)
     session = SourceSession(session_factory=session_factory_for(excel, events))
     session.start()

@@ -646,6 +646,110 @@ def test_write_one_group_retries_compatible_block_failure_from_fresh_master_copy
     assert len([event for event in events if event[0] == "publish"]) == 1
 
 
+def test_write_one_group_propagates_fatal_rowwise_retry_and_cleans_both_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = CanonicalKey("text", "A")
+    master = tmp_path / "m.xlsx"
+    master.write_bytes(b"clean master")
+    target = OutputTarget(key, "A", tmp_path / "result.xlsx", None)
+    snapshot = WorkbookSnapshot(
+        Path("source.xlsx"),
+        FileSignature(1, 2, "abc"),
+        "Sheet1",
+        "Table1",
+        "Team",
+        3,
+        (GroupSummary(key, "A", 1, (1,)),),
+    )
+    events: list[object] = []
+
+    class Rows:
+        Count = 3
+
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        def __call__(self, index: int):
+            if self.attempt == 1:
+                return SimpleNamespace()
+            return SimpleNamespace(
+                Delete=lambda: (_ for _ in ()).throw(
+                    RuntimeError(f"row-wise failure at {index}")
+                )
+            )
+
+    class Workbook:
+        Sheets = SimpleNamespace(Count=1)
+
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+            self.sheet = SimpleNamespace(FilterMode=False)
+            self.table = SimpleNamespace(
+                Name="Table1", ListRows=Rows(attempt)
+            )
+
+        def Save(self) -> None:
+            events.append(("save", self.attempt))
+
+        def Close(self, **options) -> None:
+            events.append(("close", self.attempt, options["SaveChanges"]))
+
+    opened: list[Workbook] = []
+
+    def open_workbook(*_args, **_kwargs):
+        workbook = Workbook(len(opened) + 1)
+        opened.append(workbook)
+        events.append(("open", workbook.attempt))
+        return workbook
+
+    copies: list[tuple[Path, Path]] = []
+    real_copy2 = shutil.copy2
+
+    def copy2(source: Path, destination: Path):
+        copies.append((Path(source), Path(destination)))
+        return real_copy2(source, destination)
+
+    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", copy2)
+    monkeypatch.setattr("excel_splitter.excel_gateway._open_workbook", open_workbook)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._validated_table",
+        lambda workbook, _sheet_name: (workbook.sheet, workbook.table),
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._publish_temp",
+        lambda *_args: events.append("publish"),
+    )
+
+    with pytest.raises(SplitExecutionError, match="행 삭제") as captured:
+        _write_one_group(
+            SimpleNamespace(
+                Calculation=-4105,
+                CalculateBeforeSave=False,
+                Calculate=lambda: events.append("calculate"),
+            ),
+            master,
+            snapshot,
+            target,
+        )
+
+    assert "row-wise failure" in str(captured.value.__cause__)
+    assert len(copies) == 2
+    assert len(opened) == 2
+    assert [event for event in events if isinstance(event, tuple) and event[0] == "close"] == [
+        ("close", 1, False),
+        ("close", 2, False),
+    ]
+    assert "publish" not in events
+    assert not target.path.exists()
+    assert tuple(tmp_path.glob("g-*.xlsx")) == ()
+
+
 def test_write_one_group_does_not_retry_unknown_block_delete_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -286,7 +286,19 @@ class SourceSession:
                 ReadOnlyRecommended=False,
                 AddToMru=False,
             )
-            # SaveAs changes the open workbook's identity to the master path.
+            try:
+                open_master_key = str(
+                    Path(str(self._workbook.FullName)).resolve(strict=False)
+                ).casefold()
+                intended_master_key = str(master.resolve(strict=False)).casefold()
+            except Exception as exc:
+                raise SplitExecutionError(
+                    f"SaveAs 후 master 경로를 확인할 수 없습니다: {exc}"
+                ) from exc
+            if open_master_key != intended_master_key:
+                raise SplitExecutionError(
+                    "SaveAs 후 열린 통합문서가 master 경로와 일치하지 않습니다."
+                )
             if snapshot.has_removable_artifacts:
                 sheet = _worksheet(self._workbook, snapshot.sheet_name)
                 delete_removable_artifacts(sheet)
