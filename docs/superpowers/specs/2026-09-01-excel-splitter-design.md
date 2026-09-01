@@ -19,11 +19,14 @@ Windows에서 실행되는 Python 기반 GUI 프로그램을 만든다. 사용�
 - 빈 셀을 독립된 분류로 처리
 - 고유값별 결과 통합문서 생성
 - 출력 폴더 선택, 파일명 미리보기, 기존 파일 덮어쓰기 확인
+- Excel에서 열 수 있는 DRM 보호 `.xlsx` 원본
+- DRM이 제거된 일반 `.xlsx` 결과 파일
 - 단일 `.exe` 배포
 
 ### 제외
 
-- `.xls`, `.xlsm`, `.xlsb`, CSV 및 암호화된 파일
+- `.xls`, `.xlsm`, `.xlsb` 및 CSV
+- Excel에서 해제할 수 없는 DRM 또는 열기 암호·편집 암호가 필요한 파일
 - 한 시트에 Table이 없거나 둘 이상인 경우의 분할
 - 여러 Table 또는 여러 컬럼을 조합한 분류
 - 외부 데이터, SharePoint, QueryTable 또는 Data Model에 연결된 Table의 분할
@@ -43,6 +46,58 @@ Windows에서 실행되는 Python 기반 GUI 프로그램을 만든다. 사용�
 프로그램은 `DispatchEx("Excel.Application")`로 별도 Excel COM 인스턴스를 생성한다. 사용자가 이미 실행 중인 Excel 인스턴스를 조회하지 않으며, 프로그램이 만든 인스턴스만 종료한다. Excel 연동은 late binding을 사용하여 개발 PC에서 생성된 COM 캐시에 의존하지 않게 한다.
 
 `openpyxl`은 테스트용 `.xlsx` fixture 생성에는 사용할 수 있지만 실제 결과 생성에는 사용하지 않는다. 결과 생성은 데스크톱 Excel이 파일을 열고 수정하고 저장하게 하여 Excel 문서 요소의 손실 위험을 줄인다.
+
+### 3.1 DRM 입력과 읽기 성능
+
+DRM 원본은 파일 시스템에서 ZIP/XML로 직접 읽지 않는다. GUI는 앱 수명 동안 하나의 전용 COM command worker를 유지하며, 이 worker만 source `Workbook`과 source용 `Excel.Application`을 소유한다. worker는 GUI 시작 후 Excel 인스턴스를 미리 생성하지만 DRM 원본은 사용자가 선택한 뒤에만 연다.
+
+원본 선택 시 파일 서명을 기록하고 `Workbooks.Open(ReadOnly=True)`을 정확히 한 번 호출한다. DRM이 Excel에서 해제된 열린 통합문서를 다음 단계가 재사용한다.
+
+- 원본 선택은 열린 통합문서에서 워크시트 이름만 읽는다.
+- 워크시트 선택은 Table 개수, 종류, 행 수 및 컬럼 이름만 검사한다. Table 아래 콘텐츠 검사는 이 단계에서 실행하지 않는다.
+- 미리보기는 같은 통합문서에서 전체 안전성 검사를 한 번 실행하고 분류 스냅샷을 만든다.
+- source 경로가 바뀌거나 디스크 서명이 달라지거나 COM 신뢰를 잃으면 열린 통합문서를 닫고 선택 상태를 무효화한다.
+- GUI 종료 시 command worker가 source 통합문서, source Excel 인스턴스, COM apartment 순서로 정리된다. COM proxy는 이 worker 밖으로 전달하지 않는다.
+
+DRM 해제와 최초 `Workbooks.Open` 비용은 피할 수 없지만 한 workflow에서 반복하지 않는다. source Excel 인스턴스는 사용자가 실행한 Excel과 분리하며, 프로그램은 자신이 만든 인스턴스만 종료한다.
+
+### 3.2 미리보기 데이터 읽기
+
+분류 열은 `ListColumn.DataBodyRange.Value2`를 한 번 읽어 Python 값 배열로 분리한다. 단일 셀일 때의 scalar와 여러 셀일 때의 2차원 배열을 동일한 행 sequence로 정규화한다. canonical key, 최초 등장 순서 및 원본 1-based `ListRow` 인덱스는 기존 계약을 유지한다.
+
+셀의 표시 문자열 `Text`는 모든 행에서 읽지 않는다. `Value2`로 canonical key를 만든 뒤 각 key가 처음 등장한 행에서만 `Text`를 읽는다. 오류, bool, 숫자, 텍스트, 빈값의 fallback label 규칙은 기존 classifier와 동일하다.
+
+Table 아래 범위 검사는 미리보기에서 한 번만 수행한다. 값·수식·병합·하이퍼링크처럼 range 단위로 판정 가능한 속성은 먼저 bulk COM 호출로 확인한다. 혼합 Style, legacy note 및 threaded comment처럼 bulk 결과가 모호한 항목만 제한적으로 셀 단위 검사한다. Excel 버전이 지원하지 않는 `CommentThreaded` 속성은 직접 호출하지 않으며, 지원되는 collection 또는 명시적인 미지원 결과로 처리한다.
+
+### 3.3 비보호 master와 병렬 출력
+
+분할 실행 직전에 디스크의 source 서명을 미리보기 서명과 다시 비교한다. 일치할 때 source용 command worker가 열린 DRM 통합문서를 출력 폴더의 UUID 임시 경로에 Excel `.xlsx` 형식으로 `SaveAs`한다. source 경로에는 저장하지 않는다.
+
+저장된 master는 다음 조건을 모두 만족해야 한다.
+
+- 일반 ZIP 기반 `.xlsx` package로 열 수 있다.
+- 필수 workbook package entry를 읽을 수 있다.
+- source 스냅샷의 워크시트, Table, 컬럼 및 행 수 식별자와 일치한다.
+- 열기 암호와 쓰기 암호가 없다.
+
+검사에 실패하면 master를 삭제하고 결과 생성을 시작하지 않는다. DRM 제품이나 조직 정책이 새 파일에도 보호를 강제하면 프로그램이 이를 우회하지 않고 “비보호 master를 만들 수 없습니다”라고 알린다. source 통합문서는 master 생성 성공 또는 실패 후 저장하지 않고 닫는다.
+
+비보호 master가 준비되면 coordinator는 기본 두 개의 output worker를 실행한다. 각 worker는 자기 thread에서 COM을 초기화하고 별도 `DispatchEx("Excel.Application")` 인스턴스를 만들며, 할당된 target을 순차 처리한 뒤 같은 thread에서 `Quit`과 COM 해제를 수행한다. master와 target 경로만 worker에 전달하고 COM proxy는 공유하지 않는다.
+
+- 분류가 두 개 이하이면 worker 한 개를 사용한다.
+- 분류가 세 개 이상이면 worker 두 개를 사용한다.
+- 각 target은 master의 별도 UUID 복사본을 열고 서로 다른 최종 경로에 배치한다.
+- 제외 행 수가 많은 target부터 worker에 배정하여 마지막 작업 편중을 줄인다.
+- 완료 결과는 미리보기 target 순서로 재정렬한다.
+- progress callback은 coordinator만 호출하며 완료 수는 0부터 전체 수까지 단조 증가한다.
+
+개별 target의 파일 복사·배치 `OSError`는 해당 분류 실패로 기록하고 다른 target을 계속한다. COM identity, open, save 또는 close 신뢰 오류는 전역 stop을 설정하여 새 target 배정을 중단한다. 이미 Excel에서 편집 중인 target은 강제 취소하지 않고 닫기와 임시 파일 정리를 마친다. 완료된 파일, 개별 실패 및 시작하지 못한 target을 포함한 부분 결과를 GUI에 표시한다.
+
+행 삭제는 원본 인덱스를 기준으로 내림차순 처리한다. 연속된 제외 인덱스는 하나의 contiguous block으로 묶어 Excel 호출 수를 줄일 수 있지만, 정식 Excel 통합 테스트에서 Table 크기·아래 콘텐츠·도형 보존이 확인된 경우에만 block 삭제를 활성화한다. 검증 전 기본 동작은 행별 `ListRow.Delete`다.
+
+### 3.4 성능 관측
+
+로그에는 source Excel 시작, DRM open, 시트 조회, Table 조회, 전체 안전성 검사, bulk 분류열 읽기, source 서명 계산, master SaveAs·검증, target별 open·delete·save와 전체 elapsed time을 기록한다. 파일 크기, 워크시트 수, Table 행 수, 유니크 분류 수, 아래 검사 범위 셀 수 및 실제 worker 수를 함께 기록한다. 로그에는 셀 값, 분류 label 및 파일 암호를 남기지 않는다.
 
 ## 4. 사용자 흐름
 
@@ -70,7 +125,7 @@ GUI는 한 화면에서 위에서 아래로 진행한다.
 - 확장자는 대소문자와 관계없이 `.xlsx`여야 한다.
 - 원본 경로가 존재하고 일반 파일이어야 한다.
 - 원본 경로와 출력 폴더에 Excel이 경로에서 지원하지 않는 대괄호 `[` 또는 `]`가 있으면 경로 변경을 요청한다.
-- 암호 또는 편집 암호가 필요한 통합문서는 지원하지 않는다.
+- Excel이 사용자 권한으로 해제할 수 있는 DRM 원본만 지원한다. 열기 암호 또는 편집 암호가 필요한 통합문서는 지원하지 않는다.
 - 통합문서 구조가 보호되어 다른 시트를 삭제할 수 없으면 분할을 시작하지 않는다.
 - 선택 워크시트 또는 Table이 보호되어 데이터 행을 삭제할 수 없으면 분할을 시작하지 않는다.
 - 선택 워크시트가 숨김 또는 매우 숨김 상태이면 분할을 시작하지 않고 이유를 표시한다. 결과 통합문서에는 이 워크시트만 남아야 하므로 최소 한 개의 표시 워크시트가 필요하다.
@@ -123,19 +178,25 @@ GUI와 파일명의 대표 문자열은 각 분류가 처음 등장한 셀의 `T
 
 분할 작업은 다음 순서로 실행한다.
 
-1. worker thread에서 COM을 초기화한다.
-2. 원본의 SHA-256, 크기, 수정 시각을 미리보기 스냅샷과 대조한다.
-3. 원본을 세션 전용 불변 master 임시 파일로 한 번 복사한다.
-4. `DispatchEx`로 숨겨진 별도 Excel 인스턴스를 시작한다.
-5. `Visible=False`, `DisplayAlerts=False`, `EnableEvents=False`, `ScreenUpdating=False`, `AskToUpdateLinks=False`를 설정한다. `Workbooks.Open`은 `UpdateLinks=0`, `AddToMru=False`, `Notify=False`, `IgnoreReadOnlyRecommended=True`를 사용한다.
-6. 각 분류에 대해 master를 최종 파일과 같은 출력 디렉터리의 고유 임시 `.xlsx`로 복사한다.
-7. 임시 복사본을 쓰기 가능 상태로 열고 워크시트·Table·컬럼 식별자와 `ListRows.Count`를 스냅샷과 대조한다.
-8. 기존 Table 필터 조건을 해제한다. 헤더의 필터 기능은 유지하되 결과 파일을 열면 남은 모든 행이 보이게 한다.
-9. 스냅샷에서 현재 분류가 아닌 원본 행 인덱스를 구하고 `ListRows`를 인덱스 내림차순으로 삭제한다. 삭제 중에는 셀 값을 다시 읽어 분류하지 않는다.
-10. 선택 워크시트를 제외한 모든 `Workbook.Sheets` 항목을 삭제한다.
-11. `ListRows.Count`가 스냅샷의 해당 분류 행 수와 같고 선택 시트만 남았는지 확인한다.
-12. 통합문서를 저장하고 닫은 뒤 같은 디렉터리의 임시 파일을 `os.replace`로 최종 경로에 배치한다.
-13. 모든 분류가 끝나거나 전체 중단 오류가 발생하면 master를 삭제하고 전용 Excel 인스턴스와 COM thread를 정리한다.
+1. source command worker가 원본의 SHA-256, 크기, 수정 시각을 미리보기 스냅샷과 대조한다.
+2. 열린 DRM 원본에서 외부 링크·연결을 갱신하지 않고 이벤트를 비활성화한 상태로 UUID master 경로에 `FileFormat=51`, 빈 `Password`와 빈 `WriteResPassword`, `ReadOnlyRecommended=False`, `AddToMru=False`를 지정하여 `SaveAs`한다.
+3. master가 일반 ZIP package이고 `[Content_Types].xml`, `_rels/.rels`, `xl/workbook.xml`, `xl/_rels/workbook.xml.rels`를 읽을 수 있는지 검사한다. 손상된 ZIP entry가 하나라도 있으면 실패한다.
+4. master를 Excel에서 빈 암호로 다시 열 수 있고 워크시트 이름, 선택 Table 이름, 선택 컬럼 이름과 `ListRows.Count`가 스냅샷과 같은지 검사한다. 분류값은 재분류하지 않는다. 같은 열린 source에서 저장한 master이므로 행 순서는 그대로여야 하며, 불일치하면 전체 작업을 중단한다.
+5. source 통합문서를 저장하지 않고 닫고 source Excel 인스턴스를 종료한다.
+6. target이 없으면 output worker를 만들지 않는다. target이 1~2개면 worker 한 개, 3개 이상이면 worker 두 개를 만든다.
+7. coordinator가 `row_count - group.count`가 큰 target부터 동적 queue에 넣으며 동률은 원래 target 순서를 따른다.
+8. 각 output worker는 자기 thread에서 COM을 초기화하고 `DispatchEx`로 숨겨진 별도 Excel 인스턴스를 시작한다. `Visible=False`, `DisplayAlerts=False`, `EnableEvents=False`, `ScreenUpdating=False`, `AskToUpdateLinks=False`를 설정한다.
+9. worker는 stop event를 확인한 뒤 target 하나를 가져와 master를 최종 파일과 같은 출력 volume의 run 전용 임시 디렉터리에 UUID `.xlsx`로 복사한다.
+10. 임시 복사본을 쓰기 가능 상태로 열고 워크시트·Table·컬럼 식별자와 `ListRows.Count`를 스냅샷과 대조한다.
+11. 기존 Table 필터 조건을 해제한다. 헤더의 필터 기능은 유지하되 결과 파일을 열면 남은 모든 행이 보이게 한다.
+12. 스냅샷에서 현재 분류가 아닌 원본 행 인덱스를 구하고 `ListRows`를 인덱스 내림차순으로 삭제한다. 삭제 중에는 셀 값을 다시 읽어 분류하지 않는다.
+13. 선택 워크시트를 제외한 모든 `Workbook.Sheets` 항목을 삭제한다.
+14. `ListRows.Count`가 스냅샷의 해당 분류 행 수와 같고 선택 시트만 남았는지 확인한다.
+15. 통합문서를 저장하고 닫은 뒤 승인 시점 target 서명을 다시 확인하고 같은 volume의 임시 파일을 `os.replace`로 최종 경로에 배치한다.
+16. worker는 target 결과를 coordinator queue에 전달한다. coordinator만 완료 progress를 올리며 성공과 개별 실패 모두 완료 수에 포함한다. 전역 중단으로 시작하지 못한 target은 완료 수에 포함하지 않는다.
+17. 개별 파일 `OSError`는 다음 target을 계속한다. COM open 전 실패는 해당 worker session을 닫고 한 번 새 session으로 재시도할 수 있다. workbook을 연 뒤 identity, save 또는 close 신뢰 오류가 발생하면 stop event를 설정하며 해당 target은 재시도하지 않는다.
+18. 모든 in-flight target이 종료되면 coordinator가 worker를 join하고 결과를 원래 target 순서로 정렬한다.
+19. master, run 전용 임시 디렉터리와 그 안의 target 임시 파일은 성공·개별 실패·전역 중단 모두 `finally`에서 삭제한다. 삭제 실패는 로그와 결과 요약에 남긴다. 앱 시작 시 app marker가 있는 자기 소유의 오래된 run 디렉터리만 정리하며 임의의 사용자 파일은 삭제하지 않는다.
 
 역순 인덱스 삭제는 행 삭제에 따른 인덱스 이동을 피하며, 수식 재계산이나 삭제 시트 참조 손상과 관계없이 최초 미리보기의 분류 소속을 유지한다. Excel의 저장·재계산 정책은 원본 통합문서 설정을 따른다. 프로그램은 외부 링크나 연결의 새로 고침을 시작하지 않는다.
 
@@ -151,7 +212,7 @@ GUI와 파일명의 대표 문자열은 각 분류가 처음 등장한 셀의 `T
 | Table 의존 수식 | 행 제거에 따른 계산 결과 변경은 허용하지만 수식 정의는 Excel이 행 삭제에 맞게 조정한 결과를 유지한다. |
 | Table 아래 콘텐츠 | 입력 검사에서 독립 사용 셀을 차단한다. 도형과 차트의 위치·크기는 삭제 전 스냅샷과 대조하고 달라졌으면 복원한 뒤 저장한다. |
 
-각 결과 파일의 배치는 원자적이지만 전체 배치는 원자적이지 않다. 파일별 처리 실패 시 그 임시 파일을 삭제하고 다음 분류를 계속한다. COM 인스턴스 종료, 통합문서 손상 의심, 원본 스냅샷 불일치처럼 Excel 세션의 신뢰를 잃는 오류는 남은 분류를 중단한다. 이미 완성된 결과는 롤백하지 않고 성공 목록에 남긴다.
+각 결과 파일의 배치는 원자적이지만 전체 배치는 원자적이지 않다. 파일별 처리 실패 시 그 임시 파일을 삭제하고 다음 분류를 계속한다. COM 인스턴스 종료, 통합문서 손상 의심, 원본 스냅샷 불일치처럼 Excel 세션의 신뢰를 잃는 오류는 새 작업 배정을 중단한다. 이미 실행 중인 다른 worker는 강제 중단하지 않고 정리하며, 완성된 결과는 롤백하지 않고 성공 목록에 남긴다. 비보호 master와 run 임시 파일은 결과 파일과 달리 영구 산출물이 아니며 모든 정상·예외 경로에서 삭제 대상이다.
 
 기존 파일 교체 실패 시 기존 파일을 유지해야 한다. `try/finally`에서 열린 통합문서 닫기, Excel 종료, COM 해제, COM thread 종료를 수행한다. 사용자 Excel 인스턴스, 열려 있는 다른 통합문서, 클립보드는 사용하지 않는다. 완료 후 성공 파일 수, 실패한 분류와 원인, 출력 폴더를 표시하며 일부 성공을 전체 성공으로 표현하지 않는다.
 
@@ -161,7 +222,8 @@ GUI와 파일명의 대표 문자열은 각 분류가 처음 등장한 셀의 `T
 
 - Excel 미설치 또는 시작 실패
 - 원본 파일 없음, 접근 권한 없음, 다른 프로그램에 의한 잠금
-- 지원하지 않는 확장자 또는 암호화된 통합문서
+- 지원하지 않는 확장자, Excel에서 해제할 수 없는 DRM 또는 암호가 필요한 통합문서
+- DRM 정책 때문에 비보호 master를 만들 수 없는 통합문서
 - Table 0개 또는 2개 이상
 - 외부 데이터에 연결된 Table 또는 Table 아래 독립 콘텐츠
 - 보호된 통합문서 구조, 워크시트 또는 Table
@@ -180,7 +242,8 @@ src/excel_splitter/
   app.py              # 진입점과 의존성 조립
   gui.py              # Tkinter 화면 및 UI 상태 전이
   models.py           # 워크시트, Table, 컬럼, 분류, 결과 모델
-  excel_gateway.py    # COM 초기화, 검사, 복사본 편집 및 정리
+  source_session.py   # 장수명 source COM worker와 DRM 원본 수명주기
+  excel_gateway.py    # COM 검사, 비보호 master 생성, 병렬 복사본 편집 및 정리
   classifier.py       # 값 정규화, 고유값 집계, 행 비교 키
   naming.py           # 패턴 검증, 파일명 정리, 충돌 해소
   split_service.py    # 사전 검사와 분할 작업 조율
@@ -209,6 +272,11 @@ GUI는 COM 객체를 직접 다루지 않는다. `split_service`는 인터페이
 - 스냅샷 행 인덱스 기반 역순 삭제 계획과 원본 변경 감지
 - Table 개수와 보호 상태 검사 결과 처리
 - 가짜 Excel gateway를 이용한 성공, 부분 실패, 정리 동작
+- source command queue의 thread affinity, 단일 open, source 변경 무효화와 종료 정리
+- bulk `Value2`의 scalar/2차원 배열 정규화와 유니크 key별 최초 `Text` 조회
+- 비보호 master ZIP 검증, 필수 package entry, SaveAs 실패와 임시 파일 정리
+- worker 수 0/1/2 경계, 최대 동시성, 동적 queue, stop event와 결과 순서 복원
+- out-of-order 완료에서도 단조 progress, 부분 성공과 미시작 target 요약
 - GUI 상태 전이와 worker 이벤트 처리
 
 ### 정식 Excel PC 통합 테스트
@@ -229,6 +297,10 @@ GUI는 COM 객체를 직접 다루지 않는다. `split_service`는 인터페이
 - 개별 파일 실패는 다음 분류를 계속하고 COM 세션 실패는 전체 작업을 중단한다.
 - 실패 후 프로그램이 시작한 Excel 프로세스가 남지 않는다.
 - 원본 파일의 해시와 수정 시간이 작업 전후로 동일하다.
+- DRM 원본은 source Excel에서 한 번만 열리고 워크시트·컬럼·미리보기가 같은 열린 통합문서를 재사용한다.
+- master와 결과 파일은 DRM이 없는 일반 `.xlsx`로 열리며 master와 임시 파일은 성공·실패 후 남지 않는다.
+- worker 두 개가 서로 다른 Excel 인스턴스에서 동시에 target을 처리하고 사용자 Excel에는 영향이 없다.
+- 직렬/병렬 결과의 시트, Table 행, 보존 요소와 파일명이 동일하다.
 
 실제 Excel 통합 테스트를 통과하기 전에는 “원본 보존 검증 완료”로 표시하지 않는다.
 
@@ -268,6 +340,8 @@ GUI는 COM 객체를 직접 다루지 않는다. `split_service`는 인터페이
 - 원본 파일은 수정되지 않는다.
 - 기존 파일은 승인 없이 덮어쓰지 않는다.
 - 실패 시 원인과 부분 성공 여부가 명확히 표시된다.
+- DRM 원본은 workflow당 한 번만 열리고 분류가 3개 이상이면 output worker 두 개를 사용한다.
+- 결과 파일은 비보호 일반 `.xlsx`이며 비보호 master와 임시 파일이 작업 후 남지 않는다.
 - 단위 테스트가 통과한다.
 - 정식 Excel PC의 통합 및 smoke test가 통과한다.
 - `ExcelSplitter.exe`가 Python 설치 없이 실행된다.
