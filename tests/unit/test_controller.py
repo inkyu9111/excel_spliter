@@ -2,10 +2,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from excel_splitter.controller import AppController
+from excel_splitter.gui import ExcelSplitterGui
 from excel_splitter.models import (
     CanonicalKey,
     FileSignature,
@@ -16,6 +18,44 @@ from excel_splitter.models import (
     TableInfo,
     WorkbookSnapshot,
 )
+
+
+class _StateDouble:
+    def __init__(self) -> None:
+        self.state = "normal"
+
+    def configure(self, *, state: str) -> None:
+        self.state = state
+
+
+class _RootDouble:
+    def protocol(self, *_args) -> None:
+        pass
+
+    def destroy(self) -> None:
+        pass
+
+
+class _VariableDouble:
+    def set(self, _value: str) -> None:
+        pass
+
+
+def test_leaving_busy_state_restores_browse_buttons() -> None:
+    gui = object.__new__(ExcelSplitterGui)
+    gui.source_button = _StateDouble()
+    gui.output_button = _StateDouble()
+    gui._input_widgets = [gui.source_button, gui.output_button]
+    gui.root = _RootDouble()
+    gui.status_var = _VariableDouble()
+    gui.controller = SimpleNamespace(state=object())
+    gui._render_state = lambda _state: None
+
+    gui._set_busy(True)
+    gui._set_busy(False)
+
+    assert gui.source_button.state == "normal"
+    assert gui.output_button.state == "normal"
 
 
 def test_script_entry_calls_main_without_requiring_package_context() -> None:

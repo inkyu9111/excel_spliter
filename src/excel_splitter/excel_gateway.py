@@ -32,6 +32,8 @@ _READ_OPEN_OPTIONS = {
     "AddToMru": False,
     "Notify": False,
     "IgnoreReadOnlyRecommended": True,
+    "Password": "",
+    "WriteResPassword": "",
 }
 _WRITE_OPEN_OPTIONS = {**_READ_OPEN_OPTIONS, "ReadOnly": False}
 _APPLICATION_SETTINGS = (
@@ -280,20 +282,28 @@ def _restore_shapes(sheet: Any, snapshot: tuple[tuple[str, float, float, float, 
 class ExcelComGateway:
     def list_worksheets(self, source: Path) -> tuple[str, ...]:
         with _excel_session() as excel:
-            workbook = _open_workbook(excel, source, read_only=True)
+            workbook = None
             try:
+                workbook = _open_workbook(excel, source, read_only=True)
                 return tuple(
                     str(workbook.Worksheets.Item(index).Name)
                     for index in range(1, workbook.Worksheets.Count + 1)
                 )
             finally:
-                _close_without_saving(workbook)
+                try:
+                    if workbook is not None:
+                        _close_without_saving(workbook)
+                finally:
+                    workbook = None
 
     def inspect_table(self, source: Path, sheet_name: str) -> TableInfo:
         with _excel_session() as excel:
-            workbook = _open_workbook(excel, source, read_only=True)
+            workbook = None
+            sheet = None
+            table = None
             try:
-                _sheet, table = _validated_table(workbook, sheet_name)
+                workbook = _open_workbook(excel, source, read_only=True)
+                sheet, table = _validated_table(workbook, sheet_name)
                 columns = tuple(
                     str(table.ListColumns.Item(index).Name)
                     for index in range(1, table.ListColumns.Count + 1)
@@ -305,16 +315,26 @@ class ExcelComGateway:
                     row_count=int(table.ListRows.Count),
                 )
             finally:
-                _close_without_saving(workbook)
+                try:
+                    if workbook is not None:
+                        _close_without_saving(workbook)
+                finally:
+                    table = None
+                    sheet = None
+                    workbook = None
 
     def build_snapshot(
         self, source: Path, sheet_name: str, column_name: str
     ) -> WorkbookSnapshot:
         signature = _capture_signature(source)
         with _excel_session() as excel:
-            workbook = _open_workbook(excel, source, read_only=True)
+            workbook = None
+            sheet = None
+            table = None
+            cell = None
             try:
-                _sheet, table = _validated_table(workbook, sheet_name)
+                workbook = _open_workbook(excel, source, read_only=True)
+                sheet, table = _validated_table(workbook, sheet_name)
                 column_index = _column_index(table, column_name)
                 samples: list[CellSample] = []
                 for row_index in range(1, table.ListRows.Count + 1):
@@ -335,7 +355,14 @@ class ExcelComGateway:
                 table_name = str(table.Name)
                 row_count = int(table.ListRows.Count)
             finally:
-                _close_without_saving(workbook)
+                try:
+                    if workbook is not None:
+                        _close_without_saving(workbook)
+                finally:
+                    cell = None
+                    table = None
+                    sheet = None
+                    workbook = None
         if _capture_signature(source) != signature:
             raise WorkbookValidationError("원본이 검사 중 변경되어 다시 검사해야 합니다.")
         groups = tuple(_group_samples(samples))
@@ -399,6 +426,8 @@ def _write_one_group(
 ) -> Path:
     temp_path = target.path.parent / f".{target.path.stem}.{uuid.uuid4().hex}.xlsx"
     workbook = None
+    sheet = None
+    table = None
     try:
         shutil.copy2(master, temp_path)
         workbook = _open_workbook(excel, temp_path, read_only=False)
@@ -442,6 +471,9 @@ def _write_one_group(
                 workbook.Close(SaveChanges=False)
             except Exception as exc:
                 close_error = exc
+        table = None
+        sheet = None
+        workbook = None
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:

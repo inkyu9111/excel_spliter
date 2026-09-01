@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
+import gc
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from excel_splitter.excel_gateway import (
     _delete_rows,
     _excel_error_code,
     _excel_session,
+    _open_workbook,
     _remove_other_sheets,
     _single_table,
     _verify_target_unchanged,
@@ -50,6 +52,48 @@ def test_delete_rows_uses_descending_indexes() -> None:
     rows = Recorder()
     _delete_rows(rows, (1, 4, 2))
     assert rows.deleted == [4, 2, 1]
+
+
+def test_open_workbook_disables_password_prompts() -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    workbooks = SimpleNamespace(
+        Open=lambda source, **options: calls.append((source, options)) or object()
+    )
+
+    _open_workbook(SimpleNamespace(Workbooks=workbooks), Path("source.xlsx"), read_only=True)
+
+    assert calls[0][1]["Password"] == ""
+    assert calls[0][1]["WriteResPassword"] == ""
+
+
+def test_list_worksheets_releases_workbook_before_session_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Workbook:
+        Worksheets = SimpleNamespace(Count=0)
+
+        def Close(self, **_kwargs) -> None:
+            events.append("close")
+
+        def __del__(self) -> None:
+            events.append("release")
+
+    excel = SimpleNamespace(
+        Workbooks=SimpleNamespace(Open=lambda *_args, **_kwargs: Workbook())
+    )
+
+    @contextmanager
+    def session():
+        yield excel
+        gc.collect()
+        events.append("session_exit")
+
+    monkeypatch.setattr("excel_splitter.excel_gateway._excel_session", session)
+
+    assert ExcelComGateway().list_worksheets(Path("source.xlsx")) == ()
+    assert events.index("release") < events.index("session_exit")
 
 
 def test_excel_error_code_detaches_the_positive_cverr_code() -> None:

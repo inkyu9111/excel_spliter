@@ -318,5 +318,7 @@ class ExcelSplitterGui:
             self.root.protocol("WM_DELETE_WINDOW", lambda: None)
             self.status_var.set("처리 중입니다...")
         else:
+            for widget in self._input_widgets:
+                widget.configure(state="normal")
             self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
             self._render_state(self.controller.state)
