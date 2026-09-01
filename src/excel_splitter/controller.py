@@ -76,6 +76,9 @@ class AppController:
             raise RuntimeError("현재 설정의 미리보기가 필요합니다.")
         return self._service.execute(preview, overwrite, progress)
 
+    def shutdown(self) -> None:
+        self._service.shutdown()
+
     @staticmethod
     def _required(value, label: str):
         if value is None:

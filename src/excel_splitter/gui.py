@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from .controller import AppController, UiState
 from .errors import ExcelSplitterError
 from .models import Preview, SplitResult
+from .parallel_writer import ParallelWriteAborted
 
 DELETED_SHEETS_WARNING = (
     "선택한 시트를 제외한 다른 시트를 삭제합니다. 삭제되는 시트에 의존하는 "
@@ -59,7 +60,7 @@ class ExcelSplitterGui:
 
         self._build()
         self._render_state(controller.state)
-        self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self.poll_queue)
 
     def _build(self) -> None:
@@ -254,7 +255,14 @@ class ExcelSplitterGui:
             "GUI 작업 실패",
             exc_info=(type(exc), exc, exc.__traceback__),
         )
-        message = str(exc) if isinstance(exc, ExcelSplitterError) else UNEXPECTED_ERROR_MESSAGE
+        if isinstance(exc, ParallelWriteAborted):
+            message = (
+                f"{exc}\n\n완료 {len(exc.partial_result.succeeded)}개, "
+                f"실패 {len(exc.partial_result.failed)}개, "
+                f"시작하지 못함 {len(exc.unstarted)}개"
+            )
+        else:
+            message = str(exc) if isinstance(exc, ExcelSplitterError) else UNEXPECTED_ERROR_MESSAGE
         messagebox.showerror("오류", message, parent=self.root)
         self._render_state(self.controller.state)
         self.status_var.set("오류가 발생했습니다.")
@@ -320,5 +328,15 @@ class ExcelSplitterGui:
         else:
             for widget in self._input_widgets:
                 widget.configure(state="normal")
-            self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
             self._render_state(self.controller.state)
+
+    def _on_close(self) -> None:
+        if self._busy:
+            return
+        try:
+            self.controller.shutdown()
+        except Exception:
+            self.logger.exception("source session 종료 실패")
+        finally:
+            self.root.destroy()

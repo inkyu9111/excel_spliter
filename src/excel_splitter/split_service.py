@@ -68,6 +68,9 @@ class SplitService:
             raise WorkbookValidationError("기존 파일 덮어쓰기 승인이 필요합니다.")
         return self.gateway.write_groups(preview.snapshot, preview.targets, progress)
 
+    def shutdown(self) -> None:
+        self.gateway.shutdown()
+
 
 def _validate_source_path(source: Path) -> None:
     if not source.exists() or not source.is_file():

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import logging
 import shutil
 import sys
+import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,12 +21,12 @@ from .models import (
     CellSample,
     FileSignature,
     OutputTarget,
-    SplitFailure,
     SplitResult,
     TableInfo,
     WorkbookSnapshot,
 )
 from .ports import ProgressCallback
+from .parallel_writer import write_targets
 
 
 _READ_OPEN_OPTIONS = {
@@ -89,6 +92,8 @@ def _excel_session() -> Iterator[Any]:
         yield excel
     except ExcelSplitterError:
         raise
+    except AttributeError:
+        threaded_comment = None
     except Exception as exc:
         raise SplitExecutionError(f"Excel 자동화에 실패했습니다: {exc}") from exc
     finally:
@@ -167,10 +172,53 @@ def _cell_has_unsupported_content(cell: Any) -> bool:
         return True
     if getattr(cell, "Comment", None) is not None:
         return True
-    if getattr(cell, "CommentThreaded", None) is not None:
+    try:
+        threaded_comment = getattr(cell, "CommentThreaded", None)
+    except Exception as exc:
+        if not _unsupported_threaded_comments_error(exc):
+            raise
+        threaded_comment = None
+    if threaded_comment is not None:
         return True
     style = getattr(cell, "Style", "Normal")
     return style not in (None, "Normal")
+
+
+def _bulk_contains_value(value: Any) -> bool:
+    if isinstance(value, (tuple, list)):
+        return any(_bulk_contains_value(item) for item in value)
+    return value not in (None, "")
+
+
+def _unsupported_threaded_comments_error(exc: Exception) -> bool:
+    hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
+    if exc.__class__.__name__ != "com_error":
+        return False
+    if hresult in (-2147352573, -2147352570):
+        return True
+    message = str(exc).casefold()
+    return hresult == -2147352567 and (
+        "commentthreaded" in message
+        or "threaded comment" in message
+        or "스레드 주석" in message
+    )
+
+
+def _threaded_comments_count(owner: Any) -> int:
+    try:
+        collection = getattr(owner, "CommentsThreaded")
+    except AttributeError:
+        return 0
+    except Exception as exc:
+        if _unsupported_threaded_comments_error(exc):
+            return 0
+        raise
+    try:
+        return int(collection.Count)
+    except Exception as exc:
+        if _unsupported_threaded_comments_error(exc):
+            return 0
+        raise
 
 
 def _validate_below_table(sheet: Any, table: Any) -> None:
@@ -184,7 +232,34 @@ def _validate_below_table(sheet: Any, table: Any) -> None:
         sheet.Cells(first_row, first_column),
         sheet.Cells(used_last_row, last_column),
     )
-    if any(_cell_has_unsupported_content(cell) for cell in _iter_cells(bounded)):
+    values = bounded.Value2
+    formulas = bounded.Formula
+    merge_cells = bounded.MergeCells
+    has_content = (
+        _bulk_contains_value(values)
+        or _bulk_contains_value(formulas)
+        or merge_cells not in (False, None)
+        or int(bounded.Hyperlinks.Count) > 0
+    )
+    if has_content:
+        raise WorkbookValidationError(
+            "Table 아래 열 범위에 삭제 시 이동될 수 있는 콘텐츠가 있습니다."
+        )
+
+    style = bounded.Style
+    if style not in (None, "Normal"):
+        raise WorkbookValidationError(
+            "Table 아래 열 범위에 삭제 시 이동될 수 있는 콘텐츠가 있습니다."
+        )
+    needs_cell_scan = (
+        merge_cells is None
+        or style is None
+        or int(sheet.Comments.Count) > 0
+        or _threaded_comments_count(sheet) > 0
+    )
+    if needs_cell_scan and any(
+        _cell_has_unsupported_content(cell) for cell in _iter_cells(bounded)
+    ):
         raise WorkbookValidationError(
             "Table 아래 열 범위에 삭제 시 이동될 수 있는 콘텐츠가 있습니다."
         )
@@ -237,6 +312,57 @@ def _verify_target_unchanged(
         raise OSError(f"대상 파일이 미리보기 후 변경되었습니다: {path}")
 
 
+def _restore_recovery(backup: Path, target: Path, reason: str) -> OSError:
+    if not target.exists():
+        try:
+            os.rename(backup, target)
+        except OSError:
+            pass
+    if backup.exists():
+        return OSError(f"{reason} 복구 파일을 보존했습니다: {backup}")
+    return OSError(reason)
+
+
+def _publish_temp(
+    temp_path: Path,
+    target_path: Path,
+    prior_signature: FileSignature | None,
+) -> None:
+    if prior_signature is None:
+        _verify_target_unchanged(target_path, None)
+        os.rename(temp_path, target_path)
+        return
+
+    backup = target_path.parent / f".esr-{uuid.uuid4().hex[:12]}.xlsx"
+    try:
+        os.rename(target_path, backup)
+    except OSError as exc:
+        raise OSError(f"기존 대상 파일을 점유하지 못했습니다: {target_path}: {exc}") from exc
+
+    try:
+        backup_signature = _capture_signature(backup)
+    except OSError as exc:
+        raise _restore_recovery(
+            backup, target_path, f"점유한 대상 파일을 검증하지 못했습니다: {exc}"
+        ) from exc
+    if backup_signature != prior_signature:
+        raise _restore_recovery(
+            backup, target_path, "대상 파일이 미리보기 후 변경되었습니다."
+        )
+    try:
+        os.rename(temp_path, target_path)
+    except OSError as exc:
+        raise _restore_recovery(
+            backup, target_path, f"결과 파일을 게시하지 못했습니다: {exc}"
+        ) from exc
+    try:
+        backup.unlink()
+    except OSError as exc:
+        raise OSError(
+            f"결과는 게시했지만 복구 파일을 삭제하지 못했습니다: {backup}: {exc}"
+        ) from exc
+
+
 def _copy_to_master(
     source: Path, expected: FileSignature, master_parent: Path
 ) -> Path:
@@ -280,101 +406,96 @@ def _restore_shapes(sheet: Any, snapshot: tuple[tuple[str, float, float, float, 
 
 
 class ExcelComGateway:
-    def list_worksheets(self, source: Path) -> tuple[str, ...]:
-        with _excel_session() as excel:
-            workbook = None
+    def __init__(self, source_session: Any | None = None) -> None:
+        if source_session is None:
+            # Local import avoids the helper dependency from source_session back
+            # into this module while keeping one persistent owner per gateway.
+            from .source_session import SourceSession
+
+            source_session = SourceSession()
+        self._source_session = source_session
+        self._started = False
+        self._active_source: Path | None = None
+        self._logger = logging.getLogger("excel_splitter")
+
+    def _ensure_started(self) -> None:
+        if not self._started:
+            self._source_session.start()
+            self._started = True
+
+    def prewarm(self) -> None:
+        self._ensure_started()
+
+    def _open_source(self, source: Path) -> Any:
+        self._active_source = None
+        try:
+            handle = self._source_session.open_source(source)
+        except Exception:
             try:
-                workbook = _open_workbook(excel, source, read_only=True)
-                return tuple(
-                    str(workbook.Worksheets.Item(index).Name)
-                    for index in range(1, workbook.Worksheets.Count + 1)
-                )
-            finally:
-                try:
-                    if workbook is not None:
-                        _close_without_saving(workbook)
-                finally:
-                    workbook = None
+                self._source_session.close_source()
+            except Exception:
+                pass
+            raise
+        self._active_source = Path(source)
+        return handle
+
+    def _discard_source_after_error(self, error: Exception) -> None:
+        self._active_source = None
+        if isinstance(error, WorkbookValidationError):
+            return
+        try:
+            self._source_session.close_source()
+        except Exception:
+            pass
+
+    def list_worksheets(self, source: Path) -> tuple[str, ...]:
+        self._ensure_started()
+        started = time.perf_counter()
+        handle = self._open_source(source)
+        self._logger.info(
+            "operation=list_worksheets elapsed_seconds=%.3f sheet_count=%d",
+            time.perf_counter() - started,
+            len(handle.sheets),
+        )
+        return handle.sheets
 
     def inspect_table(self, source: Path, sheet_name: str) -> TableInfo:
-        with _excel_session() as excel:
-            workbook = None
-            sheet = None
-            table = None
-            try:
-                workbook = _open_workbook(excel, source, read_only=True)
-                sheet, table = _validated_table(workbook, sheet_name)
-                columns = tuple(
-                    str(table.ListColumns.Item(index).Name)
-                    for index in range(1, table.ListColumns.Count + 1)
-                )
-                return TableInfo(
-                    sheet_name=str(sheet_name),
-                    table_name=str(table.Name),
-                    columns=columns,
-                    row_count=int(table.ListRows.Count),
-                )
-            finally:
-                try:
-                    if workbook is not None:
-                        _close_without_saving(workbook)
-                finally:
-                    table = None
-                    sheet = None
-                    workbook = None
+        self._ensure_started()
+        started = time.perf_counter()
+        if self._active_source != Path(source):
+            self._open_source(source)
+        try:
+            info = self._source_session.inspect_table(sheet_name)
+        except Exception as exc:
+            self._discard_source_after_error(exc)
+            raise
+        self._logger.info(
+            "operation=inspect_table elapsed_seconds=%.3f row_count=%d column_count=%d",
+            time.perf_counter() - started,
+            info.row_count,
+            len(info.columns),
+        )
+        return info
 
     def build_snapshot(
         self, source: Path, sheet_name: str, column_name: str
     ) -> WorkbookSnapshot:
-        signature = _capture_signature(source)
-        with _excel_session() as excel:
-            workbook = None
-            sheet = None
-            table = None
-            cell = None
-            try:
-                workbook = _open_workbook(excel, source, read_only=True)
-                sheet, table = _validated_table(workbook, sheet_name)
-                column_index = _column_index(table, column_name)
-                samples: list[CellSample] = []
-                for row_index in range(1, table.ListRows.Count + 1):
-                    cell = table.ListRows.Item(row_index).Range.Cells.Item(
-                        1, column_index
-                    )
-                    value = cell.Value2
-                    error_code = _excel_error_code(value)
-                    samples.append(
-                        CellSample(
-                            row_index=row_index,
-                            value=value,
-                            text=str(cell.Text),
-                            is_error=error_code is not None,
-                            error_code=error_code,
-                        )
-                    )
-                table_name = str(table.Name)
-                row_count = int(table.ListRows.Count)
-            finally:
-                try:
-                    if workbook is not None:
-                        _close_without_saving(workbook)
-                finally:
-                    cell = None
-                    table = None
-                    sheet = None
-                    workbook = None
-        if _capture_signature(source) != signature:
-            raise WorkbookValidationError("원본이 검사 중 변경되어 다시 검사해야 합니다.")
-        groups = tuple(_group_samples(samples))
-        return WorkbookSnapshot(
-            source=source,
-            signature=signature,
-            sheet_name=sheet_name,
-            table_name=table_name,
-            column_name=column_name,
-            row_count=row_count,
-            groups=groups,
+        self._ensure_started()
+        started = time.perf_counter()
+        if self._active_source != Path(source):
+            self._open_source(source)
+        try:
+            snapshot = self._source_session.build_snapshot(sheet_name, column_name)
+        except Exception as exc:
+            self._discard_source_after_error(exc)
+            raise
+        self._logger.info(
+            "operation=build_snapshot elapsed_seconds=%.3f row_count=%d group_count=%d",
+            time.perf_counter() - started,
+            snapshot.row_count,
+            len(snapshot.groups),
         )
+        return snapshot
 
     def write_groups(
         self,
@@ -382,40 +503,69 @@ class ExcelComGateway:
         targets: tuple[OutputTarget, ...],
         progress: ProgressCallback,
     ) -> SplitResult:
-        succeeded: list[Path] = []
-        failed: list[SplitFailure] = []
-        if not targets:
-            return SplitResult((), ())
-        target_parent = targets[0].path.parent
+        started = time.perf_counter()
+        target_parent = targets[0].path.parent if targets else snapshot.source.parent
         normalized_parent = target_parent.resolve(strict=False)
         if any(
             target.path.parent.resolve(strict=False) != normalized_parent
             for target in targets[1:]
         ):
             raise SplitExecutionError("모든 결과 파일은 같은 출력 폴더에 있어야 합니다.")
-        master = _copy_to_master(
-            snapshot.source, snapshot.signature, target_parent
-        )
+        self._ensure_started()
+        run_dir = Path(tempfile.mkdtemp(prefix=".e", dir=target_parent))
         try:
-            with _excel_session() as excel:
-                for completed, target in enumerate(targets, start=1):
-                    progress(completed - 1, len(targets), target.label)
-                    try:
-                        output = _write_one_group(excel, master, snapshot, target)
-                        succeeded.append(output)
-                    except OSError as exc:
-                        failed.append(SplitFailure(target.label, str(exc)))
-                    progress(completed, len(targets), target.label)
+            longest_excel_temp = run_dir / "g-000000000000.xlsx"
+            if len(str(longest_excel_temp.resolve(strict=False))) > 218:
+                raise SplitExecutionError(
+                    "출력 폴더가 너무 깊어 Excel 임시 경로가 218자를 넘습니다."
+                )
+            if self._active_source != snapshot.source:
+                self._open_source(snapshot.source)
+            try:
+                master = self._source_session.save_plain_master(run_dir, snapshot)
+            finally:
+                self._source_session.close_source()
+                self._active_source = None
+            result = write_targets(
+                master,
+                snapshot,
+                targets,
+                _write_one_group,
+                _excel_session,
+                progress,
+            )
+            self._logger.info(
+                "operation=write_groups elapsed_seconds=%.3f target_count=%d success_count=%d failure_count=%d",
+                time.perf_counter() - started,
+                len(targets),
+                len(result.succeeded),
+                len(result.failed),
+            )
+            return result
         finally:
             active_error = sys.exception()
-            try:
-                master.unlink(missing_ok=True)
-            except OSError as exc:
-                if active_error is None:
-                    raise SplitExecutionError(
-                        f"master 임시 파일을 삭제하지 못했습니다: {exc}"
-                    ) from exc
-        return SplitResult(tuple(succeeded), tuple(failed))
+            cleanup_error: OSError | None = None
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(run_dir)
+                    cleanup_error = None
+                    break
+                except OSError as exc:
+                    cleanup_error = exc
+                    if attempt < 2:
+                        time.sleep(0.05)
+            if cleanup_error is not None:
+                message = f"평문 임시 폴더가 남았습니다: {run_dir}: {cleanup_error}"
+                if active_error is not None:
+                    message = f"{active_error}; {message}"
+                    raise SplitExecutionError(message) from active_error
+                raise SplitExecutionError(message) from cleanup_error
+
+    def shutdown(self) -> None:
+        try:
+            self._source_session.shutdown()
+        finally:
+            self._active_source = None
 
 
 def _write_one_group(
@@ -424,7 +574,7 @@ def _write_one_group(
     snapshot: WorkbookSnapshot,
     target: OutputTarget,
 ) -> Path:
-    temp_path = target.path.parent / f".{target.path.stem}.{uuid.uuid4().hex}.xlsx"
+    temp_path = master.parent / f"g-{uuid.uuid4().hex[:12]}.xlsx"
     workbook = None
     sheet = None
     table = None
@@ -460,8 +610,7 @@ def _write_one_group(
         workbook.Save()
         workbook.Close(SaveChanges=False)
         workbook = None
-        _verify_target_unchanged(target.path, target.prior_signature)
-        os.replace(temp_path, target.path)
+        _publish_temp(temp_path, target.path, target.prior_signature)
         return target.path
     finally:
         active_error = sys.exception()

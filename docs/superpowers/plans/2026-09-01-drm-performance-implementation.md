@@ -179,19 +179,19 @@ Expected: failures show the old per-action Excel sessions and serial writer.
 
 Replace per-action source `_excel_session` calls with the persistent session. Keep GUI events plain and render only on the Tk main thread. Split shallow and full Table validation. Replace per-row snapshot loop with `group_bulk_samples`.
 
-- [ ] **Step 4: Wire master creation and parallel output**
+- [x] **Step 4: Wire master creation and parallel output**
 
-Execute source signature guard, request plain master from source worker, close source, then call `write_targets`. Move current `_write_one_group` into the callable used by output workers. Preserve target signature verification, `os.replace`, filter clearing, sheet deletion, row-count verification, shape restoration and temp cleanup.
+Execute source signature guard, request plain master from source worker, close source, then call `write_targets`. Move current `_write_one_group` into the callable used by output workers. Preserve target signature verification, Windows no-clobber rename and recovery backup publication, filter clearing, sheet deletion, row-count verification, shape restoration and temp cleanup.
 
-- [ ] **Step 5: Add timing instrumentation and shutdown handling**
+- [x] **Step 5: Add timing instrumentation and shutdown handling**
 
 Use `time.perf_counter` and the existing rotating logger. Log operation name, elapsed time and counts only. Do not log cell values or group labels. App shutdown must close source workbook and its Excel instance before destroying the Tk root.
 
-- [ ] **Step 6: Run all unit tests**
+- [x] **Step 6: Run all unit tests**
 
 Run: `python -m pytest tests/unit -q -p no:cacheprovider`
 
-Expected: all tests pass.
+Expected: all tests pass. Final verified result before packaging: `118 passed`.
 
 - [ ] **Step 7: Rebuild and verify the EXE**
 

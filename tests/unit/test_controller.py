@@ -8,6 +8,7 @@ import pytest
 
 from excel_splitter.controller import AppController
 from excel_splitter.gui import ExcelSplitterGui
+from excel_splitter.parallel_writer import ParallelWriteAborted
 from excel_splitter.models import (
     CanonicalKey,
     FileSignature,
@@ -56,6 +57,44 @@ def test_leaving_busy_state_restores_browse_buttons() -> None:
 
     assert gui.source_button.state == "normal"
     assert gui.output_button.state == "normal"
+
+
+def test_idle_window_close_shuts_down_session_before_destroy() -> None:
+    events: list[str] = []
+    gui = object.__new__(ExcelSplitterGui)
+    gui._busy = False
+    gui.controller = SimpleNamespace(shutdown=lambda: events.append("shutdown"))
+    gui.root = SimpleNamespace(destroy=lambda: events.append("destroy"))
+    gui.logger = SimpleNamespace(exception=lambda *_args, **_kwargs: None)
+
+    gui._on_close()
+
+    assert events == ["shutdown", "destroy"]
+
+
+def test_parallel_abort_error_reports_partial_and_unstarted_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shown: list[str] = []
+    gui = object.__new__(ExcelSplitterGui)
+    gui._set_busy = lambda _busy: None
+    gui.logger = SimpleNamespace(error=lambda *_args, **_kwargs: None)
+    gui.root = object()
+    gui.controller = SimpleNamespace(state=object())
+    gui._render_state = lambda _state: None
+    gui.status_var = SimpleNamespace(set=lambda _value: None)
+    partial = SplitResult((Path("done.xlsx"),), ())
+    error = ParallelWriteAborted("worker failed", partial, (Path("later.xlsx"),))
+    monkeypatch.setattr(
+        "excel_splitter.gui.messagebox.showerror",
+        lambda _title, message, **_kwargs: shown.append(message),
+    )
+
+    gui._handle_error(error)
+
+    assert "완료 1개" in shown[0]
+    assert "실패 0개" in shown[0]
+    assert "시작하지 못함 1개" in shown[0]
 
 
 def test_script_entry_calls_main_without_requiring_package_context() -> None:
@@ -114,6 +153,9 @@ class FakeService:
         self.execute_calls.append((preview, overwrite))
         progress(1, 1, "A")
         return SplitResult((Path("A_분할.xlsx"),), ())
+
+    def shutdown(self):
+        self.shutdown_called = True
 
 
 def _preview() -> Preview:
@@ -224,3 +266,10 @@ def test_execute_rejects_missing_or_invalidated_preview() -> None:
     controller.set_pattern("%_결과")
     with pytest.raises(RuntimeError, match="미리보기"):
         controller.execute(False, lambda *_: None)
+
+
+def test_controller_shutdown_delegates_to_service() -> None:
+    service = FakeService()
+    controller = AppController(service)
+    controller.shutdown()
+    assert service.shutdown_called is True

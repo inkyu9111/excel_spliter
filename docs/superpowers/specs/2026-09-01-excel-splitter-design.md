@@ -59,6 +59,8 @@ DRM 원본은 파일 시스템에서 ZIP/XML로 직접 읽지 않는다. GUI는 
 - source 경로가 바뀌거나 디스크 서명이 달라지거나 COM 신뢰를 잃으면 열린 통합문서를 닫고 선택 상태를 무효화한다.
 - GUI 종료 시 command worker가 source 통합문서, source Excel 인스턴스, COM apartment 순서로 정리된다. COM proxy는 이 worker 밖으로 전달하지 않는다.
 
+원본 선택 시 SHA-256·크기·수정 시각을 모두 기록한다. 워크시트 선택과 미리보기에서는 같은 열린 Workbook을 사용하면서 크기와 수정 시각만 빠르게 재검사하고, 실제 분할의 `SaveAs` 직전에 SHA-256까지 다시 계산한다. GUI가 표시된 직후 source Excel 인스턴스는 백그라운드에서 미리 준비하여 첫 원본 선택의 `DispatchEx` 시작 비용을 숨긴다.
+
 DRM 해제와 최초 `Workbooks.Open` 비용은 피할 수 없지만 한 workflow에서 반복하지 않는다. source Excel 인스턴스는 사용자가 실행한 Excel과 분리하며, 프로그램은 자신이 만든 인스턴스만 종료한다.
 
 ### 3.2 미리보기 데이터 읽기
@@ -167,12 +169,12 @@ GUI와 파일명의 대표 문자열은 각 분류가 처음 등장한 셀의 `T
 5. 확장자를 제외한 이름이 `CON`, `PRN`, `AUX`, `NUL`, `COM1`~`COM9`, `LPT1`~`LPT9`와 대소문자 무관하게 같으면 앞에 `_`를 붙인다.
 6. 정리 후 이름이 비거나 확장자만 남으면 패턴 오류로 처리한다.
 7. Windows의 대소문자 무관 비교로 이름이 겹치면 두 번째부터 확장자 앞에 ` (2)`, ` (3)`을 붙인다.
-8. 접미사까지 적용한 전체 절대 경로가 218자를 넘으면 패턴 또는 출력 폴더 수정을 요청한다.
+8. 접미사까지 적용한 전체 절대 경로 또는 run 디렉터리 안의 Excel 임시 경로가 218자를 넘으면 패턴 또는 출력 폴더 수정을 요청한다.
 9. 최종 경로가 원본 경로와 대소문자 무관하게 같으면 실행을 차단한다.
 
 예를 들어 `%_가나다`와 값 `데이터1`은 `데이터1_가나다.xlsx`, 빈 분류는 `_가나다.xlsx`가 된다. 오류값과 서로 다른 표시 문자열이 문자 정리 후 같은 이름이 되더라도 7단계에서 충돌을 해소한다.
 
-기존 결과 파일이 하나라도 있으면 분할 전에 전체 목록을 보여준다. 사용자가 승인한 경우에만 교체하며, 승인하지 않으면 어떤 결과 파일도 만들지 않는다. 승인 시 기존 충돌 파일의 크기, 수정 시각과 SHA-256을 기록한다. 최종 교체 직전에 경로 상태가 승인 시점과 다르면 해당 분류를 실패 처리하여 승인 뒤 생성되거나 변경된 파일을 덮어쓰지 않는다.
+기존 결과 파일이 하나라도 있으면 분할 전에 전체 목록을 보여준다. 사용자가 승인한 경우에만 교체하며, 승인하지 않으면 어떤 결과 파일도 만들지 않는다. 승인 시 기존 충돌 파일의 크기, 수정 시각과 SHA-256을 기록한다. 게시 시 신규 target은 Windows의 no-clobber `os.rename`으로 생성한다. 승인된 기존 target은 같은 폴더의 고유 recovery 경로로 먼저 원자적으로 이동하고 그 파일의 서명을 다시 확인한 뒤, 임시 결과를 no-clobber rename으로 게시한다. 서명이 다르거나 제3자가 target을 선점하면 어느 파일도 덮지 않으며, 자동 복구할 수 없는 경우 recovery 경로를 오류에 표시한다.
 
 ## 8. 결과 생성 알고리즘
 
@@ -192,11 +194,11 @@ GUI와 파일명의 대표 문자열은 각 분류가 처음 등장한 셀의 `T
 12. 스냅샷에서 현재 분류가 아닌 원본 행 인덱스를 구하고 `ListRows`를 인덱스 내림차순으로 삭제한다. 삭제 중에는 셀 값을 다시 읽어 분류하지 않는다.
 13. 선택 워크시트를 제외한 모든 `Workbook.Sheets` 항목을 삭제한다.
 14. `ListRows.Count`가 스냅샷의 해당 분류 행 수와 같고 선택 시트만 남았는지 확인한다.
-15. 통합문서를 저장하고 닫은 뒤 승인 시점 target 서명을 다시 확인하고 같은 volume의 임시 파일을 `os.replace`로 최종 경로에 배치한다.
+15. 통합문서를 저장하고 닫은 뒤 신규 target은 no-clobber `os.rename`으로 게시한다. 기존 target은 고유 recovery 경로로 원자 claim하고 recovery의 승인 시점 서명을 재확인한 다음 임시 결과를 no-clobber rename으로 게시한다. 실패 시 target이 비어 있을 때만 recovery를 되돌리며, 이미 점유되었으면 recovery 파일을 보존하고 경로를 보고한다.
 16. worker는 target 결과를 coordinator queue에 전달한다. coordinator만 완료 progress를 올리며 성공과 개별 실패 모두 완료 수에 포함한다. 전역 중단으로 시작하지 못한 target은 완료 수에 포함하지 않는다.
-17. 개별 파일 `OSError`는 다음 target을 계속한다. COM open 전 실패는 해당 worker session을 닫고 한 번 새 session으로 재시도할 수 있다. workbook을 연 뒤 identity, save 또는 close 신뢰 오류가 발생하면 stop event를 설정하며 해당 target은 재시도하지 않는다.
+17. 개별 파일 `OSError`는 다음 target을 계속한다. workbook identity, open, save 또는 close 신뢰 오류가 발생하면 stop event를 설정하며 해당 target은 재시도하지 않는다.
 18. 모든 in-flight target이 종료되면 coordinator가 worker를 join하고 결과를 원래 target 순서로 정렬한다.
-19. master, run 전용 임시 디렉터리와 그 안의 target 임시 파일은 성공·개별 실패·전역 중단 모두 `finally`에서 삭제한다. 삭제 실패는 로그와 결과 요약에 남긴다. 앱 시작 시 app marker가 있는 자기 소유의 오래된 run 디렉터리만 정리하며 임의의 사용자 파일은 삭제하지 않는다.
+19. master, run 전용 임시 디렉터리와 그 안의 target 임시 파일은 성공·개별 실패·전역 중단 모두 `finally`에서 삭제한다. 삭제는 짧게 재시도하며, 끝내 실패하면 원래 처리 오류와 평문 잔존 경로를 함께 표시한다. 사용자 target을 claim한 recovery 파일은 run 디렉터리 밖에 두어 자동 복구가 불가능한 충돌이나 비정상 종료에서도 사용자 데이터가 삭제되지 않게 한다.
 
 역순 인덱스 삭제는 행 삭제에 따른 인덱스 이동을 피하며, 수식 재계산이나 삭제 시트 참조 손상과 관계없이 최초 미리보기의 분류 소속을 유지한다. Excel의 저장·재계산 정책은 원본 통합문서 설정을 따른다. 프로그램은 외부 링크나 연결의 새로 고침을 시작하지 않는다.
 
@@ -325,7 +327,7 @@ GUI는 COM 객체를 직접 다루지 않는다. `split_service`는 인터페이
 - [`Workbooks.Open` 문서](https://learn.microsoft.com/en-us/office/vba/api/excel.workbooks.open)는 `UpdateLinks=0`이 외부 링크를 갱신하지 않는다고 정의한다.
 - [openpyxl 문서](https://openpyxl.readthedocs.io/en/stable/tutorial.html)는 기존 파일을 열고 저장할 때 지원하지 않는 도형이 손실될 수 있다고 경고하므로 실제 결과 편집에 사용하지 않는다.
 - [PyInstaller 문서](https://pyinstaller.org/en/stable/operating-mode.html)는 Python 인터프리터를 묶은 단일 실행 파일과 Python 미설치 실행을 설명한다.
-- Python의 [`os.replace` 문서](https://docs.python.org/3/library/os.html#os.replace)는 같은 파일시스템에서 성공한 교체가 원자적임을 정의한다.
+- Python의 [`os.rename` 문서](https://docs.python.org/3/library/os.html#os.rename)는 Windows에서 대상 경로가 존재하면 `FileExistsError`를 발생시키므로 같은 volume의 no-clobber 게시에 사용한다.
 - Microsoft의 [Excel 사양 및 제한](https://support.microsoft.com/en-us/office/excel-specifications-and-limits-1672b34d-7043-467e-8e27-269d656771c3)은 경로를 포함한 파일명 길이를 218자로 제한한다.
 - `pywin32`의 [`DispatchEx` 구현](https://github.com/mhammond/pywin32/blob/main/com/win32com/client/__init__.py)은 `CoCreateInstanceEx`를 호출하며, Microsoft는 [Excel을 다중 인스턴스 COM 서버로 설명](https://learn.microsoft.com/ko-kr/previous-versions/office/troubleshoot/office-developer/use-visual-c-automate-run-program-instance)한다.
 
