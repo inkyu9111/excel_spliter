@@ -36,8 +36,6 @@ from excel_splitter.excel_gateway import (
     _open_workbook,
     _publish_temp,
     _remove_other_sheets,
-    _restore_shapes,
-    _shape_snapshot,
     _single_table,
     _validate_below_table,
     _verify_target_unchanged,
@@ -361,64 +359,11 @@ def test_output_excel_session_does_not_access_calculation_before_workbook_open(
         assert output_excel is created[0]
 
 
-def test_shape_snapshot_frees_shapes_before_rows_move_and_restores_all_properties() -> None:
-    shape = SimpleNamespace(
-        Name="Logo",
-        Left=10.0,
-        Top=20.0,
-        Width=30.0,
-        Height=40.0,
-        Placement=1,
-    )
-    shapes = SimpleNamespace(Count=1, Item=lambda _key: shape)
-    sheet = SimpleNamespace(Shapes=shapes)
-
-    snapshot = _shape_snapshot(sheet)
-
-    assert shape.Placement == 3
-    shape.Left, shape.Top, shape.Width, shape.Height, shape.Placement = (
-        1,
-        2,
-        3,
-        4,
-        2,
-    )
-    _restore_shapes(sheet, snapshot)
-    assert (
-        shape.Left,
-        shape.Top,
-        shape.Width,
-        shape.Height,
-        shape.Placement,
-    ) == (10.0, 20.0, 30.0, 40.0, 1)
-
-
-def test_restore_shapes_reports_missing_shape_name_and_stage() -> None:
-    shape = SimpleNamespace(
-        Name="Delete Button",
-        Left=10.0,
-        Top=20.0,
-        Width=30.0,
-        Height=40.0,
-        Placement=1,
-    )
-    available: dict[object, object] = {1: shape, "Delete Button": shape}
-    sheet = SimpleNamespace(
-        Shapes=SimpleNamespace(Count=1, Item=lambda key: available[key])
-    )
-    snapshot = _shape_snapshot(sheet)
-    del available["Delete Button"]
-
-    with pytest.raises(SplitExecutionError, match="도형 복원.*Delete Button"):
-        _restore_shapes(sheet, snapshot)
-
-
 @pytest.mark.parametrize(
     ("failed_stage", "expected_message"),
     (
         ("open", "파일 열기"),
         ("delete", "행 삭제"),
-        ("restore", "도형 복원"),
         ("save", "저장"),
     ),
 )
@@ -483,12 +428,6 @@ def test_write_one_group_identifies_the_failed_com_stage(
             "excel_splitter.excel_gateway._delete_rows",
             lambda *_: (_ for _ in ()).throw(RuntimeError("COM delete failed")),
         )
-    if failed_stage == "restore":
-        monkeypatch.setattr(
-            "excel_splitter.excel_gateway._restore_shapes",
-            lambda *_: (_ for _ in ()).throw(RuntimeError("COM shape failed")),
-        )
-
     with pytest.raises(SplitExecutionError, match=expected_message):
         _write_one_group(
             SimpleNamespace(Calculate=lambda: None),
@@ -501,7 +440,8 @@ def test_write_one_group_identifies_the_failed_com_stage(
 def _stub_successful_group_write(
     monkeypatch: pytest.MonkeyPatch,
     open_workbook,
-    shape_snapshot=lambda _sheet: (),
+    delete_rows=lambda *_args: None,
+    sheet=None,
 ) -> tuple[WorkbookSnapshot, OutputTarget]:
     key = CanonicalKey("text", "A")
     snapshot = WorkbookSnapshot(
@@ -514,7 +454,8 @@ def _stub_successful_group_write(
         (GroupSummary(key, "A", 1, (1,)),),
     )
     target = OutputTarget(key, "A", Path("result.xlsx"), None)
-    sheet = SimpleNamespace(Shapes=SimpleNamespace(Count=0), FilterMode=False)
+    if sheet is None:
+        sheet = SimpleNamespace(FilterMode=False)
     table = SimpleNamespace(Name="Table1", ListRows=SimpleNamespace(Count=1))
     monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
     monkeypatch.setattr("excel_splitter.excel_gateway._open_workbook", open_workbook)
@@ -523,15 +464,56 @@ def _stub_successful_group_write(
         lambda *_args: (sheet, table),
     )
     monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway._shape_snapshot", shape_snapshot
-    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._delete_rows", delete_rows)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
     )
-    monkeypatch.setattr("excel_splitter.excel_gateway._restore_shapes", lambda *_: None)
     monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
     return snapshot, target
+
+
+def test_write_one_group_never_restores_comment_shape_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shape = SimpleNamespace(
+        Name="Comment 4",
+        Left=10.0,
+        Top=20.0,
+        Width=30.0,
+        Height=40.0,
+        Placement=1,
+    )
+    lookups: list[object] = []
+
+    class Shapes:
+        Count = 1
+
+        def Item(self, key: object):
+            lookups.append(key)
+            return shape
+
+    workbook = SimpleNamespace(
+        Sheets=SimpleNamespace(Count=1),
+        Save=lambda: None,
+        Close=lambda **_kwargs: None,
+    )
+    sheet = SimpleNamespace(FilterMode=False, Shapes=Shapes())
+    snapshot, target = _stub_successful_group_write(
+        monkeypatch,
+        lambda *_args, **_kwargs: workbook,
+        sheet=sheet,
+    )
+
+    assert (
+        _write_one_group(
+            SimpleNamespace(Calculate=lambda: None),
+            Path("master.xlsx"),
+            snapshot,
+            target,
+        )
+        == target.path
+    )
+    assert lookups == []
 
 
 def test_write_one_group_reapplies_manual_calculation_after_workbook_open(
@@ -567,14 +549,13 @@ def test_write_one_group_reapplies_manual_calculation_after_workbook_open(
         excel.CalculateBeforeSave = False
         return workbook
 
-    def shape_snapshot(_sheet):
+    def delete_rows(*_args):
         observed_before_delete.append(
             (excel.Calculation, excel.CalculateBeforeSave)
         )
-        return ()
 
     snapshot, target = _stub_successful_group_write(
-        monkeypatch, open_workbook, shape_snapshot
+        monkeypatch, open_workbook, delete_rows
     )
 
     _write_one_group(excel, Path("master.xlsx"), snapshot, target)
@@ -679,7 +660,7 @@ def test_manual_calculation_allows_parallel_mutation_but_serializes_saves(
         def Close(self, **_kwargs) -> None:
             pass
 
-    sheet = SimpleNamespace(Shapes=SimpleNamespace(Count=0), FilterMode=False)
+    sheet = SimpleNamespace(FilterMode=False)
     table = SimpleNamespace(Name="Table1", ListRows=SimpleNamespace(Count=1))
     monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
     monkeypatch.setattr(
@@ -691,7 +672,7 @@ def test_manual_calculation_allows_parallel_mutation_but_serializes_saves(
         lambda *_args: (sheet, table),
     )
 
-    def shape_snapshot(_sheet):
+    def delete_rows(*_args):
         nonlocal active_mutations, maximum_active_mutations
         with state_lock:
             active_mutations += 1
@@ -699,11 +680,8 @@ def test_manual_calculation_allows_parallel_mutation_but_serializes_saves(
         mutation_barrier.wait(timeout=1)
         with state_lock:
             active_mutations -= 1
-        return ()
 
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway._shape_snapshot", shape_snapshot
-    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._delete_rows", delete_rows)
     monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
@@ -828,7 +806,7 @@ def test_partial_calculation_restore_failure_is_fatal_before_mutation(
     )
     snapshot, target = _stub_successful_group_write(
         monkeypatch, lambda *_args, **_kwargs: workbook,
-        shape_snapshot=lambda _sheet: events.append("mutate") or (),
+        delete_rows=lambda *_args: events.append("mutate"),
     )
 
     with pytest.raises(SplitExecutionError, match="파일 열기"):
@@ -837,7 +815,7 @@ def test_partial_calculation_restore_failure_is_fatal_before_mutation(
     assert events == []
 
 
-def test_calculation_1004_fallback_serializes_mutation_restore_and_save(
+def test_calculation_1004_fallback_serializes_mutation_and_save(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = CanonicalKey("text", "A")
@@ -886,7 +864,7 @@ def test_calculation_1004_fallback_serializes_mutation_restore_and_save(
         def Close(self, **_kwargs) -> None:
             pass
 
-    sheet = SimpleNamespace(Shapes=SimpleNamespace(Count=0), FilterMode=False)
+    sheet = SimpleNamespace(FilterMode=False)
     table = SimpleNamespace(Name="Table1", ListRows=SimpleNamespace(Count=1))
     monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
     monkeypatch.setattr(
@@ -899,22 +877,18 @@ def test_calculation_1004_fallback_serializes_mutation_restore_and_save(
     )
     monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
 
-    def shape_snapshot(_sheet):
+    def delete_rows(*_args):
         nonlocal active_operations, maximum_active_operations
         with state_lock:
             active_operations += 1
             maximum_active_operations = max(
                 maximum_active_operations, active_operations
             )
-        return ()
 
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway._shape_snapshot", shape_snapshot
-    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._delete_rows", delete_rows)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
     )
-    monkeypatch.setattr("excel_splitter.excel_gateway._restore_shapes", lambda *_: None)
     monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
     errors: list[Exception] = []
 

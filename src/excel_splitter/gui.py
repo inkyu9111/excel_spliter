@@ -190,6 +190,8 @@ class ExcelSplitterGui:
         if preview is None:
             return
         prompt = DELETED_SHEETS_WARNING
+        if preview.snapshot.has_removable_artifacts:
+            prompt += "\n\n메모 및 도형은 삭제됩니다"
         if preview.collisions:
             collision_list = "\n".join(str(path) for path in preview.collisions)
             prompt += "\n\n다음 기존 파일을 덮어씁니다:\n" + collision_list

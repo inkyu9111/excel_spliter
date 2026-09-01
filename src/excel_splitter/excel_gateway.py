@@ -18,6 +18,10 @@ from .errors import (
     SplitExecutionError,
     WorkbookValidationError,
 )
+from .excel_artifacts import (
+    threaded_comment_count,
+    unsupported_threaded_comments_error,
+)
 from .models import (
     CellSample,
     FileSignature,
@@ -51,7 +55,6 @@ _APPLICATION_SETTINGS = (
 _SAFE_APPLICATION_VALUES = (False, False, False, False, False, 3)
 _XL_CALCULATION_MANUAL = -4135
 _XL_CALCULATION_AUTOMATIC = -4105
-_XL_FREE_FLOATING = 3
 _SAVE_LOCK = threading.Lock()
 
 # CVErr values returned by Excel through Value2 (signed HRESULT form).
@@ -266,7 +269,7 @@ def _cell_has_unsupported_content(cell: Any) -> bool:
     try:
         threaded_comment = getattr(cell, "CommentThreaded", None)
     except Exception as exc:
-        if not _unsupported_threaded_comments_error(exc):
+        if not unsupported_threaded_comments_error(exc):
             raise
         threaded_comment = None
     if threaded_comment is not None:
@@ -279,37 +282,6 @@ def _bulk_contains_value(value: Any) -> bool:
     if isinstance(value, (tuple, list)):
         return any(_bulk_contains_value(item) for item in value)
     return value not in (None, "")
-
-
-def _unsupported_threaded_comments_error(exc: Exception) -> bool:
-    hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
-    if exc.__class__.__name__ != "com_error":
-        return False
-    if hresult in (-2147352573, -2147352570):
-        return True
-    message = str(exc).casefold()
-    return hresult == -2147352567 and (
-        "commentthreaded" in message
-        or "threaded comment" in message
-        or "스레드 주석" in message
-    )
-
-
-def _threaded_comments_count(owner: Any) -> int:
-    try:
-        collection = getattr(owner, "CommentsThreaded")
-    except AttributeError:
-        return 0
-    except Exception as exc:
-        if _unsupported_threaded_comments_error(exc):
-            return 0
-        raise
-    try:
-        return int(collection.Count)
-    except Exception as exc:
-        if _unsupported_threaded_comments_error(exc):
-            return 0
-        raise
 
 
 def _validate_below_table(sheet: Any, table: Any) -> None:
@@ -346,7 +318,7 @@ def _validate_below_table(sheet: Any, table: Any) -> None:
         merge_cells is None
         or style is None
         or int(sheet.Comments.Count) > 0
-        or _threaded_comments_count(sheet) > 0
+        or threaded_comment_count(sheet) > 0
     )
     if needs_cell_scan and any(
         _cell_has_unsupported_content(cell) for cell in _iter_cells(bounded)
@@ -471,49 +443,6 @@ def _copy_to_master(
     except Exception:
         master.unlink(missing_ok=True)
         raise
-
-
-def _shape_snapshot(
-    sheet: Any,
-) -> tuple[tuple[str, float, float, float, float, Any], ...]:
-    shapes = sheet.Shapes
-    shape_items = tuple(
-        shapes.Item(index) for index in range(1, shapes.Count + 1)
-    )
-    snapshot = tuple(
-        (
-            str(shape.Name),
-            shape.Left,
-            shape.Top,
-            shape.Width,
-            shape.Height,
-            shape.Placement,
-        )
-        for shape in shape_items
-    )
-    for shape in shape_items:
-        shape.Placement = _XL_FREE_FLOATING
-    return snapshot
-
-
-def _restore_shapes(
-    sheet: Any,
-    snapshot: tuple[tuple[str, float, float, float, float, Any], ...],
-) -> None:
-    for name, left, top, width, height, placement in snapshot:
-        try:
-            shape = sheet.Shapes.Item(name)
-            shape.Left = left
-            shape.Top = top
-            shape.Width = width
-            shape.Height = height
-            shape.Placement = placement
-        except ExcelSplitterError:
-            raise
-        except Exception as exc:
-            raise SplitExecutionError(
-                f"도형 복원 중 '{name}' 도형을 복원하지 못했습니다: {exc}"
-            ) from exc
 
 
 @contextmanager
@@ -722,9 +651,8 @@ def _write_one_group(
         remove = tuple(
             index for index in range(1, snapshot.row_count + 1) if index not in retained
         )
-        def mutate_and_restore() -> None:
+        def mutate() -> None:
             with _com_stage("행 삭제"):
-                shapes = _shape_snapshot(sheet)
                 if bool(getattr(sheet, "FilterMode", False)):
                     sheet.ShowAllData()
                 _delete_rows(table.ListRows, remove)
@@ -733,11 +661,9 @@ def _write_one_group(
                     raise SplitExecutionError("선택 워크시트 하나만 남기지 못했습니다.")
                 if int(table.ListRows.Count) != len(selected.row_indexes):
                     raise SplitExecutionError("결과 Table 행 수가 예상과 다릅니다.")
-            with _com_stage("도형 복원"):
-                _restore_shapes(sheet, shapes)
 
         if calculation_state.manual:
-            mutate_and_restore()
+            mutate()
             with _com_stage("저장"):
                 with _SAVE_LOCK:
                     excel.Calculate()
@@ -745,7 +671,7 @@ def _write_one_group(
                     workbook.Save()
         else:
             with _SAVE_LOCK:
-                mutate_and_restore()
+                mutate()
                 with _com_stage("저장"):
                     excel.Calculate()
                     workbook.Save()

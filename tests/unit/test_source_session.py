@@ -63,6 +63,9 @@ class Workbook:
             UsedRange=SimpleNamespace(
                 Row=1, Rows=SimpleNamespace(Count=row_count + 1)
             ),
+            Comments=SimpleNamespace(Count=0),
+            CommentsThreaded=SimpleNamespace(Count=0),
+            Shapes=SimpleNamespace(Count=0),
         )
         self.Worksheets = Collection([self.sheet])
         self.ProtectStructure = False
@@ -148,6 +151,7 @@ def test_open_inspect_and_snapshot_reuse_one_thread_owned_workbook(
     assert handle.sheets == ("Data",)
     assert info.table_name == "Orders"
     assert snapshot.groups == (group,)
+    assert snapshot.has_removable_artifacts is False
     assert len(excel.open_calls) == 1
     worker_threads = {thread_id for _, _, thread_id in excel.open_calls}
     worker_threads.update(sample_threads)
@@ -381,6 +385,49 @@ def test_save_plain_master_uses_safe_options_and_reopens_for_identity_check(
     finally:
         session.shutdown()
     assert [name for name, _ in events].count("close") == 2
+
+
+def test_snapshot_flags_artifacts_and_plain_master_cleans_them_after_save_as(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.xlsx"
+    source.write_bytes(b"source")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    events: list[tuple[str, int]] = []
+    source_workbook = Workbook(events)
+    source_workbook.sheet.Comments.Count = 1
+    verified_workbook = Workbook(events)
+    sequence: list[str] = []
+
+    def save_as(filename: str, **_options: object) -> None:
+        sequence.append("save-as")
+        write_minimal_xlsx(Path(filename))
+
+    source_workbook.SaveAs = save_as
+    source_workbook.Save = lambda: sequence.append("save")
+
+    def delete(sheet: object) -> None:
+        assert sheet is source_workbook.sheet
+        assert sequence == ["save-as"]
+        sequence.append("delete")
+
+    monkeypatch.setattr(
+        "excel_splitter.source_session.delete_removable_artifacts", delete
+    )
+    opened = iter((source_workbook, verified_workbook))
+    excel = Excel(events, lambda _path: next(opened))
+    session = SourceSession(session_factory=session_factory_for(excel, events))
+    session.start()
+    session.open_source(source)
+    snapshot = session.build_snapshot("Data", "Team")
+    try:
+        assert snapshot.has_removable_artifacts is True
+        session.save_plain_master(run_dir, snapshot)
+    finally:
+        session.shutdown()
+
+    assert sequence == ["save-as", "delete", "save"]
 
 
 @pytest.mark.parametrize("failure", ["package", "identity"])

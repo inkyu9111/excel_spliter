@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, TypeVar
 
 from .errors import SplitExecutionError, WorkbookValidationError
+from .excel_artifacts import delete_removable_artifacts, has_removable_artifacts
 from .excel_gateway import (
     _close_without_saving,
     _column_index,
@@ -263,6 +264,7 @@ class SourceSession:
             column_name=column_name,
             row_count=row_count,
             groups=groups,
+            has_removable_artifacts=has_removable_artifacts(sheet),
         )
 
     def _save_plain_master(
@@ -284,8 +286,11 @@ class SourceSession:
                 ReadOnlyRecommended=False,
                 AddToMru=False,
             )
-            _verify_xlsx_package(master)
             # SaveAs changes the open workbook's identity to the master path.
+            if snapshot.has_removable_artifacts:
+                sheet = _worksheet(self._workbook, snapshot.sheet_name)
+                delete_removable_artifacts(sheet)
+                self._workbook.Save()
             # Validate that in-memory copy first, then release it before the
             # required reopen check; Excel may reject opening the same path
             # while the SaveAs workbook still owns it.
@@ -297,6 +302,7 @@ class SourceSession:
             _column_index(table, snapshot.column_name)
             if int(table.ListRows.Count) != snapshot.row_count:
                 raise SplitExecutionError("master의 Table 행 수가 다릅니다.")
+            _verify_xlsx_package(master)
             self._close_source()
             verified_workbook = _open_workbook(
                 self._excel, master, read_only=True

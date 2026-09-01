@@ -52,6 +52,7 @@ class WorkbookSnapshot:
     column_name: str
     row_count: int
     groups: tuple[GroupSummary, ...]
+    has_removable_artifacts: bool = False
 
 
 @dataclass(frozen=True)
