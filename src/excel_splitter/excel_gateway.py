@@ -5,6 +5,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -48,6 +49,9 @@ _APPLICATION_SETTINGS = (
     "AutomationSecurity",
 )
 _SAFE_APPLICATION_VALUES = (False, False, False, False, False, 3)
+_XL_CALCULATION_MANUAL = -4135
+_XL_FREE_FLOATING = 3
+_SAVE_LOCK = threading.Lock()
 
 # CVErr values returned by Excel through Value2 (signed HRESULT form).
 _EXCEL_ERROR_CODES = {2000, 2007, 2015, 2023, 2029, 2036, 2042, 2043, 2045}
@@ -92,8 +96,6 @@ def _excel_session() -> Iterator[Any]:
         yield excel
     except ExcelSplitterError:
         raise
-    except AttributeError:
-        threaded_comment = None
     except Exception as exc:
         raise SplitExecutionError(f"Excel 자동화에 실패했습니다: {exc}") from exc
     finally:
@@ -108,6 +110,14 @@ def _excel_session() -> Iterator[Any]:
             except Exception:
                 pass
         pythoncom.CoUninitialize()
+
+
+@contextmanager
+def _output_excel_session() -> Iterator[Any]:
+    with _excel_session() as excel:
+        excel.Calculation = _XL_CALCULATION_MANUAL
+        excel.CalculateBeforeSave = True
+        yield excel
 
 
 def _single_table(tables: Any) -> Any:
@@ -382,27 +392,59 @@ def _copy_to_master(
         raise
 
 
-def _shape_snapshot(sheet: Any) -> tuple[tuple[str, float, float, float, float], ...]:
+def _shape_snapshot(
+    sheet: Any,
+) -> tuple[tuple[str, float, float, float, float, Any], ...]:
     shapes = sheet.Shapes
-    return tuple(
-        (
-            str(shapes.Item(index).Name),
-            shapes.Item(index).Left,
-            shapes.Item(index).Top,
-            shapes.Item(index).Width,
-            shapes.Item(index).Height,
-        )
-        for index in range(1, shapes.Count + 1)
+    shape_items = tuple(
+        shapes.Item(index) for index in range(1, shapes.Count + 1)
     )
+    snapshot = tuple(
+        (
+            str(shape.Name),
+            shape.Left,
+            shape.Top,
+            shape.Width,
+            shape.Height,
+            shape.Placement,
+        )
+        for shape in shape_items
+    )
+    for shape in shape_items:
+        shape.Placement = _XL_FREE_FLOATING
+    return snapshot
 
 
-def _restore_shapes(sheet: Any, snapshot: tuple[tuple[str, float, float, float, float], ...]) -> None:
-    for name, left, top, width, height in snapshot:
-        shape = sheet.Shapes.Item(name)
-        shape.Left = left
-        shape.Top = top
-        shape.Width = width
-        shape.Height = height
+def _restore_shapes(
+    sheet: Any,
+    snapshot: tuple[tuple[str, float, float, float, float, Any], ...],
+) -> None:
+    for name, left, top, width, height, placement in snapshot:
+        try:
+            shape = sheet.Shapes.Item(name)
+            shape.Left = left
+            shape.Top = top
+            shape.Width = width
+            shape.Height = height
+            shape.Placement = placement
+        except ExcelSplitterError:
+            raise
+        except Exception as exc:
+            raise SplitExecutionError(
+                f"도형 복원 중 '{name}' 도형을 복원하지 못했습니다: {exc}"
+            ) from exc
+
+
+@contextmanager
+def _com_stage(stage: str) -> Iterator[None]:
+    try:
+        yield
+    except (ExcelSplitterError, OSError):
+        raise
+    except Exception as exc:
+        raise SplitExecutionError(
+            f"{stage} 중 Excel 자동화에 실패했습니다: {exc}"
+        ) from exc
 
 
 class ExcelComGateway:
@@ -531,7 +573,7 @@ class ExcelComGateway:
                 snapshot,
                 targets,
                 _write_one_group,
-                _excel_session,
+                _output_excel_session,
                 progress,
             )
             self._logger.info(
@@ -580,17 +622,24 @@ def _write_one_group(
     table = None
     try:
         shutil.copy2(master, temp_path)
-        workbook = _open_workbook(excel, temp_path, read_only=False)
-        sheet, table = _validated_table(workbook, snapshot.sheet_name)
-        if str(table.Name) != snapshot.table_name:
-            raise SplitExecutionError("Table 식별자가 미리보기와 다릅니다.")
-        _column_index(table, snapshot.column_name)
-        if int(table.ListRows.Count) != snapshot.row_count:
-            raise SplitExecutionError("Table 행 수가 미리보기와 다릅니다.")
+        with _com_stage("파일 열기"):
+            workbook = _open_workbook(excel, temp_path, read_only=False)
+            excel.Calculation = _XL_CALCULATION_MANUAL
+            excel.CalculateBeforeSave = True
+            if (
+                excel.Calculation != _XL_CALCULATION_MANUAL
+                or not bool(excel.CalculateBeforeSave)
+            ):
+                raise SplitExecutionError(
+                    "파일 열기 후 수동 계산 설정을 적용하지 못했습니다."
+                )
+            sheet, table = _validated_table(workbook, snapshot.sheet_name)
+            if str(table.Name) != snapshot.table_name:
+                raise SplitExecutionError("Table 식별자가 미리보기와 다릅니다.")
+            _column_index(table, snapshot.column_name)
+            if int(table.ListRows.Count) != snapshot.row_count:
+                raise SplitExecutionError("Table 행 수가 미리보기와 다릅니다.")
 
-        shapes = _shape_snapshot(sheet)
-        if bool(getattr(sheet, "FilterMode", False)):
-            sheet.ShowAllData()
         selected = next(
             (group for group in snapshot.groups if group.key == target.key), None
         )
@@ -600,14 +649,21 @@ def _write_one_group(
         remove = tuple(
             index for index in range(1, snapshot.row_count + 1) if index not in retained
         )
-        _delete_rows(table.ListRows, remove)
-        _remove_other_sheets(workbook.Sheets, snapshot.sheet_name)
-        if workbook.Sheets.Count != 1:
-            raise SplitExecutionError("선택 워크시트 하나만 남기지 못했습니다.")
-        if int(table.ListRows.Count) != len(selected.row_indexes):
-            raise SplitExecutionError("결과 Table 행 수가 예상과 다릅니다.")
-        _restore_shapes(sheet, shapes)
-        workbook.Save()
+        with _com_stage("행 삭제"):
+            shapes = _shape_snapshot(sheet)
+            if bool(getattr(sheet, "FilterMode", False)):
+                sheet.ShowAllData()
+            _delete_rows(table.ListRows, remove)
+            _remove_other_sheets(workbook.Sheets, snapshot.sheet_name)
+            if workbook.Sheets.Count != 1:
+                raise SplitExecutionError("선택 워크시트 하나만 남기지 못했습니다.")
+            if int(table.ListRows.Count) != len(selected.row_indexes):
+                raise SplitExecutionError("결과 Table 행 수가 예상과 다릅니다.")
+        with _com_stage("도형 복원"):
+            _restore_shapes(sheet, shapes)
+        with _com_stage("저장"):
+            with _SAVE_LOCK:
+                workbook.Save()
         workbook.Close(SaveChanges=False)
         workbook = None
         _publish_temp(temp_path, target.path, target.prior_signature)

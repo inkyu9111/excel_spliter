@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import sys
 import os
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+import excel_splitter.excel_gateway as excel_gateway
 
 from excel_splitter.errors import (
     SplitExecutionError,
@@ -32,6 +36,8 @@ from excel_splitter.excel_gateway import (
     _open_workbook,
     _publish_temp,
     _remove_other_sheets,
+    _restore_shapes,
+    _shape_snapshot,
     _single_table,
     _validate_below_table,
     _verify_target_unchanged,
@@ -286,6 +292,376 @@ def test_excel_session_always_quits_and_uninitializes(
             raise RuntimeError("open failed")
 
     assert events == ["initialize", "quit", "uninitialize"]
+
+
+def test_excel_session_does_not_swallow_attribute_error_from_with_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Excel:
+        def Quit(self) -> None:
+            events.append("quit")
+
+    pythoncom = SimpleNamespace(
+        CoInitialize=lambda: events.append("initialize"),
+        CoUninitialize=lambda: events.append("uninitialize"),
+    )
+    client = SimpleNamespace(DispatchEx=lambda _name: Excel())
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+
+    with pytest.raises(SplitExecutionError, match="Excel 자동화"):
+        with _excel_session():
+            raise AttributeError("missing COM member")
+
+    assert events == ["initialize", "quit", "uninitialize"]
+
+
+def test_output_excel_session_uses_manual_calculation_without_changing_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[SimpleNamespace] = []
+
+    def dispatch(_name: str) -> SimpleNamespace:
+        excel = SimpleNamespace(
+            Calculation=-4105,
+            CalculateBeforeSave=False,
+            Quit=lambda: None,
+        )
+        created.append(excel)
+        return excel
+
+    pythoncom = SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None)
+    client = SimpleNamespace(DispatchEx=dispatch)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+
+    output_session = getattr(excel_gateway, "_output_excel_session", None)
+    assert output_session is not None
+    with output_session() as output_excel:
+        assert output_excel.Calculation == -4135
+        assert output_excel.CalculateBeforeSave is True
+    with _excel_session() as source_excel:
+        assert source_excel.Calculation == -4105
+        assert source_excel.CalculateBeforeSave is False
+
+
+def test_shape_snapshot_frees_shapes_before_rows_move_and_restores_all_properties() -> None:
+    shape = SimpleNamespace(
+        Name="Logo",
+        Left=10.0,
+        Top=20.0,
+        Width=30.0,
+        Height=40.0,
+        Placement=1,
+    )
+    shapes = SimpleNamespace(Count=1, Item=lambda _key: shape)
+    sheet = SimpleNamespace(Shapes=shapes)
+
+    snapshot = _shape_snapshot(sheet)
+
+    assert shape.Placement == 3
+    shape.Left, shape.Top, shape.Width, shape.Height, shape.Placement = (
+        1,
+        2,
+        3,
+        4,
+        2,
+    )
+    _restore_shapes(sheet, snapshot)
+    assert (
+        shape.Left,
+        shape.Top,
+        shape.Width,
+        shape.Height,
+        shape.Placement,
+    ) == (10.0, 20.0, 30.0, 40.0, 1)
+
+
+def test_restore_shapes_reports_missing_shape_name_and_stage() -> None:
+    shape = SimpleNamespace(
+        Name="Delete Button",
+        Left=10.0,
+        Top=20.0,
+        Width=30.0,
+        Height=40.0,
+        Placement=1,
+    )
+    available: dict[object, object] = {1: shape, "Delete Button": shape}
+    sheet = SimpleNamespace(
+        Shapes=SimpleNamespace(Count=1, Item=lambda key: available[key])
+    )
+    snapshot = _shape_snapshot(sheet)
+    del available["Delete Button"]
+
+    with pytest.raises(SplitExecutionError, match="도형 복원.*Delete Button"):
+        _restore_shapes(sheet, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "expected_message"),
+    (
+        ("open", "파일 열기"),
+        ("delete", "행 삭제"),
+        ("restore", "도형 복원"),
+        ("save", "저장"),
+    ),
+)
+def test_write_one_group_identifies_the_failed_com_stage(
+    failed_stage: str,
+    expected_message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = CanonicalKey("text", "A")
+    snapshot = WorkbookSnapshot(
+        Path("source.xlsx"),
+        FileSignature(1, 2, "abc"),
+        "Sheet1",
+        "Table1",
+        "Team",
+        1,
+        (GroupSummary(key, "A", 1, (1,)),),
+    )
+    target = OutputTarget(key, "A", Path("result.xlsx"), None)
+    sheet = SimpleNamespace(
+        Shapes=SimpleNamespace(Count=0),
+        FilterMode=False,
+    )
+    rows = SimpleNamespace(Count=1)
+    table = SimpleNamespace(Name="Table1", ListRows=rows)
+
+    class Workbook:
+        Sheets = SimpleNamespace(Count=1)
+
+        def Save(self) -> None:
+            if failed_stage == "save":
+                raise RuntimeError("COM save failed")
+
+        def Close(self, **_kwargs) -> None:
+            pass
+
+    workbook = Workbook()
+    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
+    if failed_stage == "open":
+        monkeypatch.setattr(
+            "excel_splitter.excel_gateway._open_workbook",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("COM open failed")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            "excel_splitter.excel_gateway._open_workbook",
+            lambda *_args, **_kwargs: workbook,
+        )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._validated_table",
+        lambda *_args: (sheet, table),
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
+    if failed_stage == "delete":
+        monkeypatch.setattr(
+            "excel_splitter.excel_gateway._delete_rows",
+            lambda *_: (_ for _ in ()).throw(RuntimeError("COM delete failed")),
+        )
+    if failed_stage == "restore":
+        monkeypatch.setattr(
+            "excel_splitter.excel_gateway._restore_shapes",
+            lambda *_: (_ for _ in ()).throw(RuntimeError("COM shape failed")),
+        )
+
+    with pytest.raises(SplitExecutionError, match=expected_message):
+        _write_one_group(SimpleNamespace(), Path("master.xlsx"), snapshot, target)
+
+
+def _stub_successful_group_write(
+    monkeypatch: pytest.MonkeyPatch,
+    open_workbook,
+    shape_snapshot=lambda _sheet: (),
+) -> tuple[WorkbookSnapshot, OutputTarget]:
+    key = CanonicalKey("text", "A")
+    snapshot = WorkbookSnapshot(
+        Path("source.xlsx"),
+        FileSignature(1, 2, "abc"),
+        "Sheet1",
+        "Table1",
+        "Team",
+        1,
+        (GroupSummary(key, "A", 1, (1,)),),
+    )
+    target = OutputTarget(key, "A", Path("result.xlsx"), None)
+    sheet = SimpleNamespace(Shapes=SimpleNamespace(Count=0), FilterMode=False)
+    table = SimpleNamespace(Name="Table1", ListRows=SimpleNamespace(Count=1))
+    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
+    monkeypatch.setattr("excel_splitter.excel_gateway._open_workbook", open_workbook)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._validated_table",
+        lambda *_args: (sheet, table),
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._shape_snapshot", shape_snapshot
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._restore_shapes", lambda *_: None)
+    monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
+    return snapshot, target
+
+
+def test_write_one_group_reapplies_manual_calculation_after_workbook_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    excel = SimpleNamespace(Calculation=-4135, CalculateBeforeSave=True)
+    workbook = SimpleNamespace(
+        Sheets=SimpleNamespace(Count=1),
+        Save=lambda: None,
+        Close=lambda **_kwargs: None,
+    )
+    observed_before_delete: list[tuple[int, bool]] = []
+
+    def open_workbook(*_args, **_kwargs):
+        excel.Calculation = -4105
+        excel.CalculateBeforeSave = False
+        return workbook
+
+    def shape_snapshot(_sheet):
+        observed_before_delete.append(
+            (excel.Calculation, excel.CalculateBeforeSave)
+        )
+        return ()
+
+    snapshot, target = _stub_successful_group_write(
+        monkeypatch, open_workbook, shape_snapshot
+    )
+
+    _write_one_group(excel, Path("master.xlsx"), snapshot, target)
+
+    assert observed_before_delete == [(-4135, True)]
+
+
+def test_write_one_group_rejects_calculation_settings_not_applied_after_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Excel:
+        def __init__(self) -> None:
+            self._calculation = -4135
+            self._calculate_before_save = True
+            self.accept_settings = True
+
+        @property
+        def Calculation(self):
+            return self._calculation
+
+        @Calculation.setter
+        def Calculation(self, value) -> None:
+            if self.accept_settings:
+                self._calculation = value
+
+        @property
+        def CalculateBeforeSave(self):
+            return self._calculate_before_save
+
+        @CalculateBeforeSave.setter
+        def CalculateBeforeSave(self, value) -> None:
+            if self.accept_settings:
+                self._calculate_before_save = value
+
+    excel = Excel()
+    workbook = SimpleNamespace(
+        Sheets=SimpleNamespace(Count=1),
+        Save=lambda: None,
+        Close=lambda **_kwargs: None,
+    )
+
+    def open_workbook(*_args, **_kwargs):
+        excel.Calculation = -4105
+        excel.CalculateBeforeSave = False
+        excel.accept_settings = False
+        return workbook
+
+    snapshot, target = _stub_successful_group_write(monkeypatch, open_workbook)
+
+    with pytest.raises(SplitExecutionError, match="파일 열기"):
+        _write_one_group(excel, Path("master.xlsx"), snapshot, target)
+
+
+def test_parallel_group_saves_are_serialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = CanonicalKey("text", "A")
+    snapshot = WorkbookSnapshot(
+        Path("source.xlsx"),
+        FileSignature(1, 2, "abc"),
+        "Sheet1",
+        "Table1",
+        "Team",
+        1,
+        (GroupSummary(key, "A", 1, (1,)),),
+    )
+    targets = (
+        OutputTarget(key, "A", Path("first.xlsx"), None),
+        OutputTarget(key, "A", Path("second.xlsx"), None),
+    )
+    state_lock = threading.Lock()
+    active_saves = 0
+    maximum_active_saves = 0
+
+    class Workbook:
+        Sheets = SimpleNamespace(Count=1)
+
+        def Save(self) -> None:
+            nonlocal active_saves, maximum_active_saves
+            with state_lock:
+                active_saves += 1
+                maximum_active_saves = max(maximum_active_saves, active_saves)
+            time.sleep(0.05)
+            with state_lock:
+                active_saves -= 1
+
+        def Close(self, **_kwargs) -> None:
+            pass
+
+    sheet = SimpleNamespace(Shapes=SimpleNamespace(Count=0), FilterMode=False)
+    table = SimpleNamespace(Name="Table1", ListRows=SimpleNamespace(Count=1))
+    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._open_workbook",
+        lambda *_args, **_kwargs: Workbook(),
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._validated_table",
+        lambda *_args: (sheet, table),
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
+    errors: list[Exception] = []
+
+    def write(target: OutputTarget) -> None:
+        try:
+            _write_one_group(SimpleNamespace(), Path("master.xlsx"), snapshot, target)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(target,)) for target in targets]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert maximum_active_saves == 1
 
 
 def test_verify_target_unchanged_rejects_a_changed_or_new_destination(
@@ -614,6 +990,7 @@ def test_gateway_reuses_source_session_and_runs_plain_master_before_parallel_wri
             events.append("shutdown")
 
     def parallel(master, actual_snapshot, targets, write_one, session_factory, progress):
+        assert session_factory is excel_gateway._output_excel_session
         events.append(("parallel", master.exists(), actual_snapshot, targets))
         return SplitResult((targets[0].path,), ())
 

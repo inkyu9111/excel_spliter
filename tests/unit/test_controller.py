@@ -38,8 +38,19 @@ class _RootDouble:
 
 
 class _VariableDouble:
-    def set(self, _value: str) -> None:
-        pass
+    def __init__(self, value: object = None) -> None:
+        self.value = value
+
+    def set(self, value: object) -> None:
+        self.value = value
+
+
+class _ProgressDouble:
+    def __init__(self, maximum: int = 1) -> None:
+        self.maximum = maximum
+
+    def configure(self, *, maximum: int) -> None:
+        self.maximum = maximum
 
 
 def test_leaving_busy_state_restores_browse_buttons() -> None:
@@ -82,6 +93,8 @@ def test_parallel_abort_error_reports_partial_and_unstarted_counts(
     gui.root = object()
     gui.controller = SimpleNamespace(state=object())
     gui._render_state = lambda _state: None
+    gui.progress_var = _VariableDouble()
+    gui.progress = _ProgressDouble()
     gui.status_var = SimpleNamespace(set=lambda _value: None)
     partial = SplitResult((Path("done.xlsx"),), ())
     error = ParallelWriteAborted("worker failed", partial, (Path("later.xlsx"),))
@@ -95,6 +108,52 @@ def test_parallel_abort_error_reports_partial_and_unstarted_counts(
     assert "완료 1개" in shown[0]
     assert "실패 0개" in shown[0]
     assert "시작하지 못함 1개" in shown[0]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("unexpected"),
+        ParallelWriteAborted(
+            "worker failed",
+            SplitResult((Path("done.xlsx"),), ()),
+            (Path("later.xlsx"),),
+        ),
+    ],
+    ids=["general", "parallel-abort"],
+)
+def test_error_resets_progress_and_next_progress_update_still_works(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gui = object.__new__(ExcelSplitterGui)
+    gui._set_busy = lambda _busy: None
+    gui.logger = SimpleNamespace(error=lambda *_args, **_kwargs: None)
+    gui.root = object()
+    gui.controller = SimpleNamespace(state=object())
+    gui._render_state = lambda _state: None
+    gui.progress_var = _VariableDouble()
+    gui.progress = _ProgressDouble()
+    gui.status_var = _VariableDouble()
+
+    def show_error(*_args: object, **_kwargs: object) -> None:
+        assert gui.progress_var.value == 0
+        assert gui.progress.maximum == 1
+
+    monkeypatch.setattr(
+        "excel_splitter.gui.messagebox.showerror",
+        show_error,
+    )
+    gui._show_progress(4, 5, "A")
+
+    gui._handle_error(error)
+
+    assert gui.progress_var.value == 0
+    assert gui.progress.maximum == 1
+
+    gui._show_progress(1, 3, "B")
+    assert gui.progress_var.value == 1
+    assert gui.progress.maximum == 3
 
 
 def test_script_entry_calls_main_without_requiring_package_context() -> None:

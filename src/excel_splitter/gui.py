@@ -263,9 +263,14 @@ class ExcelSplitterGui:
             )
         else:
             message = str(exc) if isinstance(exc, ExcelSplitterError) else UNEXPECTED_ERROR_MESSAGE
+        self._reset_progress()
         messagebox.showerror("오류", message, parent=self.root)
         self._render_state(self.controller.state)
         self.status_var.set("오류가 발생했습니다.")
+
+    def _reset_progress(self) -> None:
+        self.progress.configure(maximum=1)
+        self.progress_var.set(0)
 
     def _show_progress(self, completed: int, total: int, label: str) -> None:
         self.progress.configure(maximum=max(total, 1))
