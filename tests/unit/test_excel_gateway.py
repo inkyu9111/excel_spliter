@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import os
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -29,7 +30,9 @@ from excel_splitter.models import (
 from excel_splitter.excel_gateway import (
     ExcelComGateway,
     _column_index,
+    _contiguous_descending_blocks,
     _copy_to_master,
+    _delete_row_blocks,
     _delete_rows,
     _excel_error_code,
     _excel_session,
@@ -146,6 +149,72 @@ def test_delete_rows_uses_descending_indexes() -> None:
     rows = Recorder()
     _delete_rows(rows, (1, 4, 2))
     assert rows.deleted == [4, 2, 1]
+
+
+@pytest.mark.parametrize(
+    ("indexes", "expected"),
+    (
+        ((), ()),
+        ((4, 2, 3, 2, 0, -1), ((2, 4),)),
+        ((1, 2, 5, 7, 6, 10), ((10, 10), (5, 7), (1, 2))),
+    ),
+)
+def test_contiguous_descending_blocks_normalize_and_coalesce(
+    indexes: tuple[int, ...], expected: tuple[tuple[int, int], ...]
+) -> None:
+    assert _contiguous_descending_blocks(indexes) == expected
+
+
+def test_delete_row_blocks_uses_table_width_ranges_in_descending_order() -> None:
+    deleted: list[tuple[int, int, int]] = []
+
+    class Worksheet:
+        def Range(self, first, last):
+            return SimpleNamespace(
+                Delete=lambda **options: deleted.append(
+                    (first.index, last.index, options["Shift"])
+                )
+            )
+
+    worksheet = Worksheet()
+
+    class Rows:
+        def __call__(self, index: int):
+            return SimpleNamespace(
+                Range=SimpleNamespace(index=index, Worksheet=worksheet)
+            )
+
+    _delete_row_blocks(Rows(), (1, 2, 5, 7, 6, 10))
+
+    assert deleted == [(10, 10, -4162), (5, 7, -4162), (1, 2, -4162)]
+
+
+def test_delete_row_blocks_signals_excel_1004_as_compatible() -> None:
+    error = RuntimeError(-2147352567, "Delete method failed")
+    error.hresult = -2147352567  # type: ignore[attr-defined]
+    error.excepinfo = (  # type: ignore[attr-defined]
+        0,
+        "Microsoft Excel",
+        "Delete method failed",
+        None,
+        0,
+        -2146827284,
+    )
+
+    class Worksheet:
+        @staticmethod
+        def Range(_first, _last):
+            return SimpleNamespace(
+                Delete=lambda **_options: (_ for _ in ()).throw(error)
+            )
+
+    row_range = SimpleNamespace(Worksheet=Worksheet())
+    rows = lambda _index: SimpleNamespace(Range=row_range)
+
+    with pytest.raises(excel_gateway._BlockDeleteCompatibilityError) as caught:
+        _delete_row_blocks(rows, (1,))
+
+    assert caught.value.__cause__ is error
 
 
 def test_open_workbook_disables_password_prompts() -> None:
@@ -425,7 +494,7 @@ def test_write_one_group_identifies_the_failed_com_stage(
     monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
     if failed_stage == "delete":
         monkeypatch.setattr(
-            "excel_splitter.excel_gateway._delete_rows",
+            "excel_splitter.excel_gateway._delete_row_blocks",
             lambda *_: (_ for _ in ()).throw(RuntimeError("COM delete failed")),
         )
     with pytest.raises(SplitExecutionError, match=expected_message):
@@ -464,12 +533,155 @@ def _stub_successful_group_write(
         lambda *_args: (sheet, table),
     )
     monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
-    monkeypatch.setattr("excel_splitter.excel_gateway._delete_rows", delete_rows)
+    monkeypatch.setattr("excel_splitter.excel_gateway._delete_row_blocks", delete_rows)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
     )
     monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
     return snapshot, target
+
+
+def test_write_one_group_retries_compatible_block_failure_from_fresh_master_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = CanonicalKey("text", "A")
+    master = tmp_path / "m.xlsx"
+    master.write_bytes(b"clean master")
+    target = OutputTarget(key, "A", tmp_path / "result.xlsx", None)
+    snapshot = WorkbookSnapshot(
+        Path("source.xlsx"),
+        FileSignature(1, 2, "abc"),
+        "Sheet1",
+        "Table1",
+        "Team",
+        3,
+        (GroupSummary(key, "A", 1, (1,)),),
+    )
+    events: list[object] = []
+
+    class Rows:
+        def __init__(self, *, supports_ranges: bool) -> None:
+            self.Count = 3
+            self.supports_ranges = supports_ranges
+
+        def __call__(self, index: int):
+            if not self.supports_ranges:
+                return SimpleNamespace()
+
+            owner = self
+
+            class Row:
+                def Delete(self) -> None:
+                    events.append(("row.delete", index))
+                    owner.Count -= 1
+
+            return Row()
+
+    class Workbook:
+        Sheets = SimpleNamespace(Count=1)
+
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+            self.sheet = SimpleNamespace(FilterMode=False)
+            self.table = SimpleNamespace(
+                Name="Table1", ListRows=Rows(supports_ranges=attempt == 2)
+            )
+
+        def Save(self) -> None:
+            events.append(("save", self.attempt))
+
+        def Close(self, **options) -> None:
+            events.append(("close", self.attempt, options["SaveChanges"]))
+
+    opened: list[Workbook] = []
+
+    def open_workbook(*_args, **_kwargs):
+        workbook = Workbook(len(opened) + 1)
+        opened.append(workbook)
+        events.append(("open", workbook.attempt))
+        return workbook
+
+    copies: list[tuple[Path, Path]] = []
+    destination_existed_before_copy: list[bool] = []
+    real_copy2 = shutil.copy2
+
+    def copy2(source: Path, destination: Path):
+        copies.append((Path(source), Path(destination)))
+        destination_existed_before_copy.append(Path(destination).exists())
+        return real_copy2(source, destination)
+
+    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", copy2)
+    monkeypatch.setattr("excel_splitter.excel_gateway._open_workbook", open_workbook)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._validated_table",
+        lambda workbook, _sheet_name: (workbook.sheet, workbook.table),
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._publish_temp",
+        lambda temp, output, _signature: events.append(("publish", temp, output)),
+    )
+    excel = SimpleNamespace(
+        Calculation=-4105,
+        CalculateBeforeSave=False,
+        Calculate=lambda: events.append("calculate"),
+    )
+
+    assert _write_one_group(excel, master, snapshot, target) == target.path
+
+    assert len(copies) == 2
+    assert copies[0] == copies[1]
+    assert destination_existed_before_copy == [False, False]
+    assert [("open", 1), ("close", 1, False), ("open", 2)] == [
+        event for event in events if event[0] in {"open", "close"}
+    ][:3]
+    assert [event for event in events if event[0] == "row.delete"] == [
+        ("row.delete", 3),
+        ("row.delete", 2),
+    ]
+    assert len([event for event in events if event[0] == "publish"]) == 1
+
+
+def test_write_one_group_does_not_retry_unknown_block_delete_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    master = tmp_path / "m.xlsx"
+    master.write_bytes(b"clean master")
+    opens = 0
+
+    def open_workbook(*_args, **_kwargs):
+        nonlocal opens
+        opens += 1
+        return SimpleNamespace(
+            Sheets=SimpleNamespace(Count=1),
+            Save=lambda: None,
+            Close=lambda **_options: None,
+        )
+
+    snapshot, target = _stub_successful_group_write(monkeypatch, open_workbook)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._delete_row_blocks",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("transport lost")),
+    )
+
+    with pytest.raises(SplitExecutionError, match="행 삭제"):
+        _write_one_group(
+            SimpleNamespace(
+                Calculation=-4105,
+                CalculateBeforeSave=False,
+                Calculate=lambda: None,
+            ),
+            master,
+            snapshot,
+            target,
+        )
+
+    assert opens == 1
 
 
 def test_write_one_group_never_restores_comment_shape_by_name(
@@ -681,7 +893,7 @@ def test_manual_calculation_allows_parallel_mutation_but_serializes_saves(
         with state_lock:
             active_mutations -= 1
 
-    monkeypatch.setattr("excel_splitter.excel_gateway._delete_rows", delete_rows)
+    monkeypatch.setattr("excel_splitter.excel_gateway._delete_row_blocks", delete_rows)
     monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
@@ -885,7 +1097,7 @@ def test_calculation_1004_fallback_serializes_mutation_and_save(
                 maximum_active_operations, active_operations
             )
 
-    monkeypatch.setattr("excel_splitter.excel_gateway._delete_rows", delete_rows)
+    monkeypatch.setattr("excel_splitter.excel_gateway._delete_row_blocks", delete_rows)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
     )

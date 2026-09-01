@@ -29,11 +29,7 @@ class ParallelWriteAborted(SplitExecutionError):
 
 
 def worker_count(target_count: int) -> int:
-    if target_count <= 0:
-        return 0
-    if target_count <= 2:
-        return 1
-    return 2
+    return min(3, max(0, target_count))
 
 
 def write_targets(

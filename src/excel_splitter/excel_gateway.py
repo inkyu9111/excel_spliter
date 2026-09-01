@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
@@ -55,6 +56,7 @@ _APPLICATION_SETTINGS = (
 _SAFE_APPLICATION_VALUES = (False, False, False, False, False, 3)
 _XL_CALCULATION_MANUAL = -4135
 _XL_CALCULATION_AUTOMATIC = -4105
+_XL_SHIFT_UP = -4162
 _SAVE_LOCK = threading.Lock()
 
 # CVErr values returned by Excel through Value2 (signed HRESULT form).
@@ -215,6 +217,61 @@ def _single_table(tables: Any) -> Any:
 def _delete_rows(rows: Any, indexes: tuple[int, ...] | list[int]) -> None:
     for index in sorted(indexes, reverse=True):
         rows(index).Delete()
+
+
+def _contiguous_descending_blocks(
+    indexes: Iterable[int],
+) -> tuple[tuple[int, int], ...]:
+    normalized = sorted({index for index in indexes if index > 0})
+    if not normalized:
+        return ()
+    blocks: list[tuple[int, int]] = []
+    first = last = normalized[0]
+    for index in normalized[1:]:
+        if index == last + 1:
+            last = index
+            continue
+        blocks.append((first, last))
+        first = last = index
+    blocks.append((first, last))
+    return tuple(reversed(blocks))
+
+
+class _BlockDeleteCompatibilityError(ExcelSplitterError):
+    pass
+
+
+def _block_delete_compatibility_error(exc: Exception) -> bool:
+    if isinstance(exc, AttributeError):
+        return True
+    hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
+    if hresult in (1004, -2146827284):
+        return True
+    excepinfo = getattr(exc, "excepinfo", None)
+    if excepinfo is None and len(exc.args) > 2:
+        excepinfo = exc.args[2]
+    scode = (
+        excepinfo[5]
+        if isinstance(excepinfo, tuple) and len(excepinfo) > 5
+        else None
+    )
+    return hresult == -2147352567 and scode == -2146827284
+
+
+def _delete_row_blocks(rows: Any, indexes: Iterable[int]) -> None:
+    for first, last in _contiguous_descending_blocks(indexes):
+        try:
+            first_range = rows(first).Range
+            last_range = rows(last).Range
+            first_range.Worksheet.Range(first_range, last_range).Delete(
+                Shift=_XL_SHIFT_UP
+            )
+        except Exception as exc:
+            if not _block_delete_compatibility_error(exc):
+                raise
+            raise _BlockDeleteCompatibilityError(
+                "Excel에서 Table 행 범위 삭제를 지원하지 않습니다."
+            ) from exc
 
 
 def _remove_other_sheets(sheets: Any, selected_name: str) -> None:
@@ -620,18 +677,19 @@ class ExcelComGateway:
             self._active_source = None
 
 
-def _write_one_group(
+def _write_group_attempt(
     excel: Any,
-    master: Path,
+    temp_path: Path,
     snapshot: WorkbookSnapshot,
     target: OutputTarget,
-) -> Path:
-    temp_path = master.parent / f"g-{uuid.uuid4().hex[:12]}.xlsx"
+    *,
+    rowwise: bool,
+) -> None:
     workbook = None
     sheet = None
     table = None
+    calculation_state: _CalculationState | None = None
     try:
-        shutil.copy2(master, temp_path)
         with _com_stage("파일 열기"):
             workbook = _open_workbook(excel, temp_path, read_only=False)
             calculation_state = _enable_manual_calculation(excel)
@@ -655,7 +713,10 @@ def _write_one_group(
             with _com_stage("행 삭제"):
                 if bool(getattr(sheet, "FilterMode", False)):
                     sheet.ShowAllData()
-                _delete_rows(table.ListRows, remove)
+                if rowwise:
+                    _delete_rows(table.ListRows, remove)
+                else:
+                    _delete_row_blocks(table.ListRows, remove)
                 _remove_other_sheets(workbook.Sheets, snapshot.sheet_name)
                 if workbook.Sheets.Count != 1:
                     raise SplitExecutionError("선택 워크시트 하나만 남기지 못했습니다.")
@@ -677,8 +738,10 @@ def _write_one_group(
                     workbook.Save()
         workbook.Close(SaveChanges=False)
         workbook = None
-        _publish_temp(temp_path, target.path, target.prior_signature)
-        return target.path
+    except _BlockDeleteCompatibilityError:
+        if calculation_state is not None and calculation_state.manual:
+            _restore_calculation_settings(excel, calculation_state)
+        raise
     finally:
         active_error = sys.exception()
         close_error: Exception | None = None
@@ -690,14 +753,45 @@ def _write_one_group(
         table = None
         sheet = None
         workbook = None
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            if active_error is None and close_error is None:
-                raise
         if close_error is not None and (
-            active_error is None or isinstance(active_error, OSError)
+            active_error is None
+            or isinstance(active_error, (OSError, _BlockDeleteCompatibilityError))
         ):
             raise SplitExecutionError(
                 f"결과 통합문서를 닫지 못했습니다: {close_error}"
             ) from close_error
+
+
+def _write_one_group(
+    excel: Any,
+    master: Path,
+    snapshot: WorkbookSnapshot,
+    target: OutputTarget,
+) -> Path:
+    temp_path = master.parent / f"g-{uuid.uuid4().hex[:12]}.xlsx"
+    try:
+        for rowwise in (False, True):
+            try:
+                shutil.copy2(master, temp_path)
+                _write_group_attempt(
+                    excel,
+                    temp_path,
+                    snapshot,
+                    target,
+                    rowwise=rowwise,
+                )
+            except _BlockDeleteCompatibilityError:
+                temp_path.unlink(missing_ok=True)
+                if rowwise:
+                    raise
+                continue
+            _publish_temp(temp_path, target.path, target.prior_signature)
+            return target.path
+        raise AssertionError("unreachable")
+    finally:
+        active_error = sys.exception()
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            if active_error is None:
+                raise

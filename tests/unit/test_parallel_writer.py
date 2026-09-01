@@ -44,13 +44,13 @@ def _fixture(count: int) -> tuple[WorkbookSnapshot, tuple[OutputTarget, ...]]:
 
 
 @pytest.mark.parametrize(
-    ("target_count", "expected"), [(0, 0), (1, 1), (2, 1), (3, 2), (20, 2)]
+    ("target_count", "expected"), [(0, 0), (1, 1), (2, 2), (3, 3), (10, 3)]
 )
 def test_worker_count_is_bounded(target_count: int, expected: int) -> None:
     assert worker_count(target_count) == expected
 
 
-def test_parallel_writes_use_two_owned_sessions_and_restore_preview_order() -> None:
+def test_parallel_writes_use_at_most_three_owned_sessions_and_restore_preview_order() -> None:
     snapshot, targets = _fixture(4)
     session_threads: set[int] = set()
     active = 0
@@ -82,8 +82,8 @@ def test_parallel_writes_use_two_owned_sessions_and_restore_preview_order() -> N
         lambda *args: progress.append(args),
     )
 
-    assert len(session_threads) == 2
-    assert maximum_active == 2
+    assert len(session_threads) == 3
+    assert maximum_active == 3
     assert result.succeeded == tuple(target.path for target in targets)
     assert not result.failed
     assert progress[0] == (0, 4, "")
