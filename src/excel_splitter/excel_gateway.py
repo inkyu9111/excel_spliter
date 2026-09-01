@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
 
 from .errors import (
     ExcelSplitterError,
@@ -50,6 +50,7 @@ _APPLICATION_SETTINGS = (
 )
 _SAFE_APPLICATION_VALUES = (False, False, False, False, False, 3)
 _XL_CALCULATION_MANUAL = -4135
+_XL_CALCULATION_AUTOMATIC = -4105
 _XL_FREE_FLOATING = 3
 _SAVE_LOCK = threading.Lock()
 
@@ -115,9 +116,89 @@ def _excel_session() -> Iterator[Any]:
 @contextmanager
 def _output_excel_session() -> Iterator[Any]:
     with _excel_session() as excel:
-        excel.Calculation = _XL_CALCULATION_MANUAL
-        excel.CalculateBeforeSave = True
         yield excel
+
+
+def _calculation_compatibility_error(exc: Exception) -> bool:
+    if isinstance(exc, AttributeError):
+        return True
+    hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
+    if hresult in (-2147352573, -2146827284):
+        return True
+    excepinfo = getattr(exc, "excepinfo", None)
+    if excepinfo is None and len(exc.args) > 2:
+        excepinfo = exc.args[2]
+    scode = (
+        excepinfo[5]
+        if isinstance(excepinfo, tuple) and len(excepinfo) > 5
+        else None
+    )
+    return hresult == -2147352567 and scode == -2146827284
+
+
+class _CalculationState(NamedTuple):
+    manual: bool
+    original_calculation: Any
+    original_calculate_before_save: Any
+
+
+def _restore_calculation_settings(
+    excel: Any,
+    state: _CalculationState,
+    *,
+    calculation_changed: bool = True,
+    calculate_before_save_changed: bool = True,
+) -> None:
+    if calculation_changed:
+        excel.Calculation = state.original_calculation
+    if calculate_before_save_changed:
+        excel.CalculateBeforeSave = state.original_calculate_before_save
+
+
+def _enable_manual_calculation(excel: Any) -> _CalculationState:
+    original_calculation = _XL_CALCULATION_AUTOMATIC
+    original_calculate_before_save = False
+    try:
+        original_calculation = getattr(
+            excel, "Calculation", _XL_CALCULATION_AUTOMATIC
+        )
+        original_calculate_before_save = getattr(
+            excel, "CalculateBeforeSave", False
+        )
+    except Exception as exc:
+        if not _calculation_compatibility_error(exc):
+            raise
+        return _CalculationState(
+            False, original_calculation, original_calculate_before_save
+        )
+    state = _CalculationState(
+        False, original_calculation, original_calculate_before_save
+    )
+    calculation_changed = False
+    calculate_before_save_changed = False
+    try:
+        # Apply CalculateBeforeSave first so a rejected manual mode cannot leave
+        # the session in manual calculation without a save-time calculation.
+        excel.CalculateBeforeSave = True
+        calculate_before_save_changed = True
+        excel.Calculation = _XL_CALCULATION_MANUAL
+        calculation_changed = True
+        applied = (
+            excel.Calculation == _XL_CALCULATION_MANUAL
+            and bool(excel.CalculateBeforeSave)
+        )
+    except Exception as exc:
+        if not _calculation_compatibility_error(exc):
+            raise
+        applied = False
+    if not applied:
+        _restore_calculation_settings(
+            excel,
+            state,
+            calculation_changed=calculation_changed,
+            calculate_before_save_changed=calculate_before_save_changed,
+        )
+    return state._replace(manual=applied)
 
 
 def _single_table(tables: Any) -> Any:
@@ -624,15 +705,7 @@ def _write_one_group(
         shutil.copy2(master, temp_path)
         with _com_stage("파일 열기"):
             workbook = _open_workbook(excel, temp_path, read_only=False)
-            excel.Calculation = _XL_CALCULATION_MANUAL
-            excel.CalculateBeforeSave = True
-            if (
-                excel.Calculation != _XL_CALCULATION_MANUAL
-                or not bool(excel.CalculateBeforeSave)
-            ):
-                raise SplitExecutionError(
-                    "파일 열기 후 수동 계산 설정을 적용하지 못했습니다."
-                )
+            calculation_state = _enable_manual_calculation(excel)
             sheet, table = _validated_table(workbook, snapshot.sheet_name)
             if str(table.Name) != snapshot.table_name:
                 raise SplitExecutionError("Table 식별자가 미리보기와 다릅니다.")
@@ -649,21 +722,33 @@ def _write_one_group(
         remove = tuple(
             index for index in range(1, snapshot.row_count + 1) if index not in retained
         )
-        with _com_stage("행 삭제"):
-            shapes = _shape_snapshot(sheet)
-            if bool(getattr(sheet, "FilterMode", False)):
-                sheet.ShowAllData()
-            _delete_rows(table.ListRows, remove)
-            _remove_other_sheets(workbook.Sheets, snapshot.sheet_name)
-            if workbook.Sheets.Count != 1:
-                raise SplitExecutionError("선택 워크시트 하나만 남기지 못했습니다.")
-            if int(table.ListRows.Count) != len(selected.row_indexes):
-                raise SplitExecutionError("결과 Table 행 수가 예상과 다릅니다.")
-        with _com_stage("도형 복원"):
-            _restore_shapes(sheet, shapes)
-        with _com_stage("저장"):
+        def mutate_and_restore() -> None:
+            with _com_stage("행 삭제"):
+                shapes = _shape_snapshot(sheet)
+                if bool(getattr(sheet, "FilterMode", False)):
+                    sheet.ShowAllData()
+                _delete_rows(table.ListRows, remove)
+                _remove_other_sheets(workbook.Sheets, snapshot.sheet_name)
+                if workbook.Sheets.Count != 1:
+                    raise SplitExecutionError("선택 워크시트 하나만 남기지 못했습니다.")
+                if int(table.ListRows.Count) != len(selected.row_indexes):
+                    raise SplitExecutionError("결과 Table 행 수가 예상과 다릅니다.")
+            with _com_stage("도형 복원"):
+                _restore_shapes(sheet, shapes)
+
+        if calculation_state.manual:
+            mutate_and_restore()
+            with _com_stage("저장"):
+                with _SAVE_LOCK:
+                    excel.Calculate()
+                    _restore_calculation_settings(excel, calculation_state)
+                    workbook.Save()
+        else:
             with _SAVE_LOCK:
-                workbook.Save()
+                mutate_and_restore()
+                with _com_stage("저장"):
+                    excel.Calculate()
+                    workbook.Save()
         workbook.Close(SaveChanges=False)
         workbook = None
         _publish_temp(temp_path, target.path, target.prior_signature)

@@ -187,20 +187,20 @@ GUI와 파일명의 대표 문자열은 각 분류가 처음 등장한 셀의 `T
 5. source 통합문서를 저장하지 않고 닫는다. source Excel 인스턴스는 다음 workflow의 사전 준비 비용을 줄이기 위해 앱 종료 때까지 유지한다.
 6. target이 없으면 output worker를 만들지 않는다. target이 1~2개면 worker 한 개, 3개 이상이면 worker 두 개를 만든다.
 7. coordinator가 `row_count - group.count`가 큰 target부터 동적 queue에 넣으며 동률은 원래 target 순서를 따른다. stop 확인과 target claim은 같은 scheduling lock 안에서 수행한다.
-8. 각 output worker는 자기 thread에서 COM을 초기화하고 `DispatchEx`로 숨겨진 별도 Excel 인스턴스를 시작한다. `Visible=False`, `DisplayAlerts=False`, `EnableEvents=False`, `ScreenUpdating=False`, `AskToUpdateLinks=False`, `Calculation=xlCalculationManual`, `CalculateBeforeSave=True`를 설정한다. 첫 통합문서를 열 때 Excel이 파일에 저장된 계산 모드로 Application 설정을 바꿀 수 있으므로 임시 복사본을 연 직후 수동 계산 설정을 다시 적용하고 확인한다.
+8. 각 output worker는 자기 thread에서 COM을 초기화하고 `DispatchEx`로 숨겨진 별도 Excel 인스턴스를 시작한다. `Visible=False`, `DisplayAlerts=False`, `EnableEvents=False`, `ScreenUpdating=False`, `AskToUpdateLinks=False`를 설정하되, 통합문서를 열기 전에는 `Calculation`과 `CalculateBeforeSave`에 접근하지 않는다.
 9. worker는 stop event를 확인한 뒤 target 하나를 가져와 master를 최종 파일과 같은 출력 volume의 run 전용 임시 디렉터리에 UUID `.xlsx`로 복사한다.
-10. 임시 복사본을 쓰기 가능 상태로 열고 워크시트·Table·컬럼 식별자와 `ListRows.Count`를 스냅샷과 대조한다.
+10. 임시 복사본을 쓰기 가능 상태로 연 직후 원래 `Calculation`과 `CalculateBeforeSave`를 기록하고 `Calculation=xlCalculationManual`, `CalculateBeforeSave=True`를 적용한 뒤 두 값을 다시 읽어 확인한다. Excel 1004, 사용할 수 없는 COM member 또는 readback 불일치는 호환성 fallback으로 처리하며, 부분 적용된 설정은 원래 값으로 복원한다. 원래 설정 복원 실패, RPC 연결 끊김 또는 server unavailable처럼 보존 계약이나 Excel 세션의 신뢰를 잃는 오류는 fatal로 처리한다. 계산 설정이 확정되면 워크시트·Table·컬럼 식별자와 `ListRows.Count`를 스냅샷과 대조한다.
 11. 선택 시트의 도형 이름·위치·크기·`Placement`를 저장하고 `xlFreeFloating`으로 전환한 뒤 기존 Table 필터 조건을 해제한다. 헤더의 필터 기능은 유지하되 결과 파일을 열면 남은 모든 행이 보이게 한다.
 12. 스냅샷에서 현재 분류가 아닌 원본 행 인덱스를 구하고 `ListRows`를 인덱스 내림차순으로 삭제한다. 삭제 중에는 셀 값을 다시 읽어 분류하지 않는다.
 13. 선택 워크시트를 제외한 모든 `Workbook.Sheets` 항목을 삭제한다.
 14. `ListRows.Count`가 스냅샷의 해당 분류 행 수와 같고 선택 시트만 남았는지 확인한다.
-15. 도형의 위치·크기·원래 `Placement`를 복원한다. 공유 save lock 안에서 저장 전 계산과 저장을 한 번 실행하고 통합문서를 닫은 뒤 신규 target은 no-clobber `os.rename`으로 게시한다. 기존 target은 고유 recovery 경로로 원자 claim하고 recovery의 승인 시점 서명을 재확인한 다음 임시 결과를 no-clobber rename으로 게시한다. 실패 시 target이 비어 있을 때만 recovery를 되돌리며, 이미 점유되었으면 recovery 파일을 보존하고 경로를 보고한다.
+15. manual 설정이 확인된 여러 worker는 각 target의 행 삭제와 도형 복원 순서를 서로 병렬로 진행하되 각 target 내부 단계는 순차 실행한다. 편집 후에는 `CalculateBeforeSave=True`가 적용된 상태에서 공유 save lock 안의 `Application.Calculate`, 원래 `Calculation`·`CalculateBeforeSave` 복원, `Save` 순서로 직렬 실행한다. 복원에 실패하면 저장·게시하지 않고 fatal로 처리한다. 호환성 fallback worker는 자동 재계산의 CPU 중첩을 막도록 행 삭제, 도형 복원, 명시적 `Application.Calculate`, `Save` 전체를 같은 공유 lock 안에서 실행한다. 통합문서를 닫은 뒤 신규 target은 no-clobber `os.rename`으로 게시한다. 기존 target은 고유 recovery 경로로 원자 claim하고 recovery의 승인 시점 서명을 재확인한 다음 임시 결과를 no-clobber rename으로 게시한다. 실패 시 target이 비어 있을 때만 recovery를 되돌리며, 이미 점유되었으면 recovery 파일을 보존하고 경로를 보고한다.
 16. worker는 target 결과를 coordinator queue에 전달한다. coordinator만 완료 progress를 올리며 성공, 개별 실패와 fatal을 발생시킨 target은 완료 수에 포함한다. fatal 시 이미 실행 중인 target의 후속 결과도 수집하고, 시작하지 못한 target은 `unstarted`로 분리하여 완료 수에 포함하지 않는다.
 17. 개별 파일 `OSError`는 다음 target을 계속한다. workbook identity, open, save 또는 close 신뢰 오류가 발생하면 stop event를 설정하며 해당 target은 재시도하지 않는다.
 18. 모든 in-flight target이 종료되면 coordinator가 worker를 join하고 결과를 원래 target 순서로 정렬한다.
 19. master, run 전용 임시 디렉터리와 그 안의 target 임시 파일은 성공·개별 실패·전역 중단 모두 `finally`에서 삭제한다. 삭제는 짧게 재시도하며, 끝내 실패하면 원래 처리 오류와 평문 잔존 경로를 함께 표시한다. 사용자 target을 claim한 recovery 파일은 run 디렉터리 밖에 두어 자동 복구가 불가능한 충돌이나 비정상 종료에서도 사용자 데이터가 삭제되지 않게 한다.
 
-역순 인덱스 삭제는 행 삭제에 따른 인덱스 이동을 피하며, 수식 재계산이나 삭제 시트 참조 손상과 관계없이 최초 미리보기의 분류 소속을 유지한다. source Excel은 원본 계산 동작을 바꾸지 않는다. output Excel은 행마다 반복 계산하지 않도록 수동 계산을 사용하고, 결과 저장 직전에 한 번 계산한다. 두 worker의 계산·저장은 동시에 실행하지 않는다. 프로그램은 외부 링크나 연결의 새로 고침을 시작하지 않는다.
+역순 인덱스 삭제는 행 삭제에 따른 인덱스 이동을 피하며, 수식 재계산이나 삭제 시트 참조 손상과 관계없이 최초 미리보기의 분류 소속을 유지한다. source Excel은 원본 계산 동작을 바꾸지 않는다. output Excel은 가능한 경우 수동 계산으로 편집을 병렬화하고 계산·원래 설정 복원·저장만 직렬화한다. 수동 계산을 사용할 수 없으면 편집부터 명시적 `Application.Calculate`와 저장까지 직렬화한다. 프로그램은 외부 링크나 연결의 새로 고침을 시작하지 않는다.
 
 ## 9. 보존 계약과 장애 안전성
 

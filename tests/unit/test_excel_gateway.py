@@ -319,17 +319,33 @@ def test_excel_session_does_not_swallow_attribute_error_from_with_body(
     assert events == ["initialize", "quit", "uninitialize"]
 
 
-def test_output_excel_session_uses_manual_calculation_without_changing_default(
+def test_output_excel_session_does_not_access_calculation_before_workbook_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    created: list[SimpleNamespace] = []
+    created: list[object] = []
 
-    def dispatch(_name: str) -> SimpleNamespace:
-        excel = SimpleNamespace(
-            Calculation=-4105,
-            CalculateBeforeSave=False,
-            Quit=lambda: None,
-        )
+    class Excel:
+        @property
+        def Calculation(self):
+            raise AssertionError("Calculation accessed before workbook open")
+
+        @Calculation.setter
+        def Calculation(self, _value) -> None:
+            raise AssertionError("Calculation changed before workbook open")
+
+        @property
+        def CalculateBeforeSave(self):
+            raise AssertionError("CalculateBeforeSave accessed before workbook open")
+
+        @CalculateBeforeSave.setter
+        def CalculateBeforeSave(self, _value) -> None:
+            raise AssertionError("CalculateBeforeSave changed before workbook open")
+
+        def Quit(self) -> None:
+            pass
+
+    def dispatch(_name: str) -> Excel:
+        excel = Excel()
         created.append(excel)
         return excel
 
@@ -342,11 +358,7 @@ def test_output_excel_session_uses_manual_calculation_without_changing_default(
     output_session = getattr(excel_gateway, "_output_excel_session", None)
     assert output_session is not None
     with output_session() as output_excel:
-        assert output_excel.Calculation == -4135
-        assert output_excel.CalculateBeforeSave is True
-    with _excel_session() as source_excel:
-        assert source_excel.Calculation == -4105
-        assert source_excel.CalculateBeforeSave is False
+        assert output_excel is created[0]
 
 
 def test_shape_snapshot_frees_shapes_before_rows_move_and_restores_all_properties() -> None:
@@ -478,7 +490,12 @@ def test_write_one_group_identifies_the_failed_com_stage(
         )
 
     with pytest.raises(SplitExecutionError, match=expected_message):
-        _write_one_group(SimpleNamespace(), Path("master.xlsx"), snapshot, target)
+        _write_one_group(
+            SimpleNamespace(Calculate=lambda: None),
+            Path("master.xlsx"),
+            snapshot,
+            target,
+        )
 
 
 def _stub_successful_group_write(
@@ -520,12 +537,29 @@ def _stub_successful_group_write(
 def test_write_one_group_reapplies_manual_calculation_after_workbook_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    excel = SimpleNamespace(Calculation=-4135, CalculateBeforeSave=True)
-    workbook = SimpleNamespace(
-        Sheets=SimpleNamespace(Count=1),
-        Save=lambda: None,
-        Close=lambda **_kwargs: None,
-    )
+    events: list[tuple[str, int, bool]] = []
+
+    class Excel:
+        Calculation = -4135
+        CalculateBeforeSave = True
+
+        def Calculate(self) -> None:
+            events.append(
+                ("calculate", self.Calculation, self.CalculateBeforeSave)
+            )
+
+    excel = Excel()
+
+    class Workbook:
+        Sheets = SimpleNamespace(Count=1)
+
+        def Save(self) -> None:
+            events.append(("save", excel.Calculation, excel.CalculateBeforeSave))
+
+        def Close(self, **_kwargs) -> None:
+            pass
+
+    workbook = Workbook()
     observed_before_delete: list[tuple[int, bool]] = []
 
     def open_workbook(*_args, **_kwargs):
@@ -546,16 +580,25 @@ def test_write_one_group_reapplies_manual_calculation_after_workbook_open(
     _write_one_group(excel, Path("master.xlsx"), snapshot, target)
 
     assert observed_before_delete == [(-4135, True)]
+    assert events == [
+        ("calculate", -4135, True),
+        ("save", -4105, False),
+    ]
+    assert (excel.Calculation, excel.CalculateBeforeSave) == (-4105, False)
 
 
-def test_write_one_group_rejects_calculation_settings_not_applied_after_open(
+def test_write_one_group_falls_back_when_calculation_settings_do_not_read_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Excel:
-        def __init__(self) -> None:
-            self._calculation = -4135
-            self._calculate_before_save = True
-            self.accept_settings = True
+        def __init__(self, events: list[str]) -> None:
+            self._calculation = -4105
+            self._calculate_before_save = False
+            self.force_readback_mismatch = False
+            self._events = events
+
+        def Calculate(self) -> None:
+            self._events.append("application.calculate")
 
         @property
         def Calculation(self):
@@ -563,19 +606,20 @@ def test_write_one_group_rejects_calculation_settings_not_applied_after_open(
 
         @Calculation.setter
         def Calculation(self, value) -> None:
-            if self.accept_settings:
-                self._calculation = value
+            self._calculation = value
 
         @property
         def CalculateBeforeSave(self):
+            if self.force_readback_mismatch and self._calculation == -4135:
+                return False
             return self._calculate_before_save
 
         @CalculateBeforeSave.setter
         def CalculateBeforeSave(self, value) -> None:
-            if self.accept_settings:
-                self._calculate_before_save = value
+            self._calculate_before_save = value
 
-    excel = Excel()
+    events: list[str] = []
+    excel = Excel(events)
     workbook = SimpleNamespace(
         Sheets=SimpleNamespace(Count=1),
         Save=lambda: None,
@@ -585,16 +629,18 @@ def test_write_one_group_rejects_calculation_settings_not_applied_after_open(
     def open_workbook(*_args, **_kwargs):
         excel.Calculation = -4105
         excel.CalculateBeforeSave = False
-        excel.accept_settings = False
+        excel.force_readback_mismatch = True
         return workbook
 
     snapshot, target = _stub_successful_group_write(monkeypatch, open_workbook)
 
-    with pytest.raises(SplitExecutionError, match="파일 열기"):
-        _write_one_group(excel, Path("master.xlsx"), snapshot, target)
+    assert _write_one_group(excel, Path("master.xlsx"), snapshot, target) == target.path
+    assert events == ["application.calculate"]
+    assert excel.Calculation == -4105
+    assert excel.CalculateBeforeSave is False
 
 
-def test_parallel_group_saves_are_serialized(
+def test_manual_calculation_allows_parallel_mutation_but_serializes_saves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     key = CanonicalKey("text", "A")
@@ -614,6 +660,9 @@ def test_parallel_group_saves_are_serialized(
     state_lock = threading.Lock()
     active_saves = 0
     maximum_active_saves = 0
+    active_mutations = 0
+    maximum_active_mutations = 0
+    mutation_barrier = threading.Barrier(2)
 
     class Workbook:
         Sheets = SimpleNamespace(Count=1)
@@ -641,6 +690,20 @@ def test_parallel_group_saves_are_serialized(
         "excel_splitter.excel_gateway._validated_table",
         lambda *_args: (sheet, table),
     )
+
+    def shape_snapshot(_sheet):
+        nonlocal active_mutations, maximum_active_mutations
+        with state_lock:
+            active_mutations += 1
+            maximum_active_mutations = max(maximum_active_mutations, active_mutations)
+        mutation_barrier.wait(timeout=1)
+        with state_lock:
+            active_mutations -= 1
+        return ()
+
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._shape_snapshot", shape_snapshot
+    )
     monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
     monkeypatch.setattr(
         "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
@@ -650,7 +713,12 @@ def test_parallel_group_saves_are_serialized(
 
     def write(target: OutputTarget) -> None:
         try:
-            _write_one_group(SimpleNamespace(), Path("master.xlsx"), snapshot, target)
+            _write_one_group(
+                SimpleNamespace(Calculate=lambda: None),
+                Path("master.xlsx"),
+                snapshot,
+                target,
+            )
         except Exception as exc:
             errors.append(exc)
 
@@ -661,7 +729,237 @@ def test_parallel_group_saves_are_serialized(
         thread.join()
 
     assert errors == []
+    assert maximum_active_mutations == 2
     assert maximum_active_saves == 1
+
+
+class FakeComError(Exception):
+    def __init__(self, hresult: int, message: str, scode: int | None = None) -> None:
+        excepinfo = (0, "Microsoft Excel", message, None, 0, scode)
+        super().__init__(hresult, message, excepinfo, None)
+        self.hresult = hresult
+        self.excepinfo = excepinfo
+
+
+def test_manual_calculation_restore_failure_aborts_before_save_and_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Excel:
+        def __init__(self) -> None:
+            self._calculation = -4105
+            self.CalculateBeforeSave = False
+
+        @property
+        def Calculation(self):
+            return self._calculation
+
+        @Calculation.setter
+        def Calculation(self, value) -> None:
+            if value == -4105 and self._calculation == -4135:
+                raise FakeComError(
+                    -2147352567, "Unable to restore Calculation", -2146827284
+                )
+            self._calculation = value
+
+        def Calculate(self) -> None:
+            events.append("calculate")
+
+    excel = Excel()
+    workbook = SimpleNamespace(
+        Sheets=SimpleNamespace(Count=1),
+        Save=lambda: events.append("save"),
+        Close=lambda **_kwargs: None,
+    )
+    snapshot, target = _stub_successful_group_write(
+        monkeypatch, lambda *_args, **_kwargs: workbook
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._publish_temp",
+        lambda *_args: events.append("publish"),
+    )
+
+    with pytest.raises(SplitExecutionError, match="저장"):
+        _write_one_group(excel, Path("master.xlsx"), snapshot, target)
+
+    assert events == ["calculate"]
+
+
+def test_partial_calculation_restore_failure_is_fatal_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Excel:
+        def __init__(self) -> None:
+            self._calculation = -4105
+            self._calculate_before_save = False
+
+        @property
+        def Calculation(self):
+            return self._calculation
+
+        @Calculation.setter
+        def Calculation(self, value) -> None:
+            if value == -4105 and self._calculation == -4135:
+                raise FakeComError(
+                    -2147352567, "Unable to restore Calculation", -2146827284
+                )
+            self._calculation = value
+
+        @property
+        def CalculateBeforeSave(self):
+            if self._calculation == -4135:
+                return False
+            return self._calculate_before_save
+
+        @CalculateBeforeSave.setter
+        def CalculateBeforeSave(self, value) -> None:
+            self._calculate_before_save = value
+
+        def Calculate(self) -> None:
+            events.append("calculate")
+
+    workbook = SimpleNamespace(
+        Sheets=SimpleNamespace(Count=1),
+        Save=lambda: events.append("save"),
+        Close=lambda **_kwargs: None,
+    )
+    snapshot, target = _stub_successful_group_write(
+        monkeypatch, lambda *_args, **_kwargs: workbook,
+        shape_snapshot=lambda _sheet: events.append("mutate") or (),
+    )
+
+    with pytest.raises(SplitExecutionError, match="파일 열기"):
+        _write_one_group(Excel(), Path("master.xlsx"), snapshot, target)
+
+    assert events == []
+
+
+def test_calculation_1004_fallback_serializes_mutation_restore_and_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = CanonicalKey("text", "A")
+    snapshot = WorkbookSnapshot(
+        Path("source.xlsx"),
+        FileSignature(1, 2, "abc"),
+        "Sheet1",
+        "Table1",
+        "Team",
+        1,
+        (GroupSummary(key, "A", 1, (1,)),),
+    )
+    targets = (
+        OutputTarget(key, "A", Path("first.xlsx"), None),
+        OutputTarget(key, "A", Path("second.xlsx"), None),
+    )
+    state_lock = threading.Lock()
+    active_operations = 0
+    maximum_active_operations = 0
+
+    class Excel:
+        def Calculate(self) -> None:
+            pass
+
+        @property
+        def Calculation(self):
+            return -4105
+
+        @Calculation.setter
+        def Calculation(self, _value) -> None:
+            raise FakeComError(
+                -2147352567,
+                "Unable to set the Calculation property of the Application class",
+                -2146827284,
+            )
+
+    class Workbook:
+        Sheets = SimpleNamespace(Count=1)
+
+        def Save(self) -> None:
+            nonlocal active_operations
+            time.sleep(0.03)
+            with state_lock:
+                active_operations -= 1
+
+        def Close(self, **_kwargs) -> None:
+            pass
+
+    sheet = SimpleNamespace(Shapes=SimpleNamespace(Count=0), FilterMode=False)
+    table = SimpleNamespace(Name="Table1", ListRows=SimpleNamespace(Count=1))
+    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_: None)
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._open_workbook",
+        lambda *_args, **_kwargs: Workbook(),
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._validated_table",
+        lambda *_args: (sheet, table),
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._column_index", lambda *_: 1)
+
+    def shape_snapshot(_sheet):
+        nonlocal active_operations, maximum_active_operations
+        with state_lock:
+            active_operations += 1
+            maximum_active_operations = max(
+                maximum_active_operations, active_operations
+            )
+        return ()
+
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._shape_snapshot", shape_snapshot
+    )
+    monkeypatch.setattr(
+        "excel_splitter.excel_gateway._remove_other_sheets", lambda *_: None
+    )
+    monkeypatch.setattr("excel_splitter.excel_gateway._restore_shapes", lambda *_: None)
+    monkeypatch.setattr("excel_splitter.excel_gateway._publish_temp", lambda *_: None)
+    errors: list[Exception] = []
+
+    def write(target: OutputTarget) -> None:
+        try:
+            _write_one_group(Excel(), Path("master.xlsx"), snapshot, target)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(target,)) for target in targets]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert maximum_active_operations == 1
+
+
+def test_noncompatibility_com_error_while_setting_calculation_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Excel:
+        @property
+        def Calculation(self):
+            return -4105
+
+        @Calculation.setter
+        def Calculation(self, _value) -> None:
+            raise FakeComError(-2147417848, "The object invoked has disconnected")
+
+    workbook = SimpleNamespace(
+        Sheets=SimpleNamespace(Count=1),
+        Save=lambda: None,
+        Close=lambda **_kwargs: None,
+    )
+    snapshot, target = _stub_successful_group_write(
+        monkeypatch, lambda *_args, **_kwargs: workbook
+    )
+
+    with pytest.raises(SplitExecutionError, match="파일 열기") as captured:
+        _write_one_group(Excel(), Path("master.xlsx"), snapshot, target)
+
+    assert isinstance(captured.value.__cause__, FakeComError)
+    assert captured.value.__cause__.hresult == -2147417848
 
 
 def test_verify_target_unchanged_rejects_a_changed_or_new_destination(
