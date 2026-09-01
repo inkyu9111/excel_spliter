@@ -1,5 +1,7 @@
 # Excel Table Splitter Implementation Plan
 
+> **Historical baseline:** DRM source reuse, bulk preview, parallel output, no-clobber publication, and the current build record are defined in [`2026-09-01-drm-performance-implementation.md`](2026-09-01-drm-performance-implementation.md). Where this baseline conflicts with that plan or the design spec, follow the DRM performance plan and [`2026-09-01-excel-splitter-design.md`](../specs/2026-09-01-excel-splitter-design.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a Windows `ExcelSplitter.exe` that splits one range-backed Excel Table by a selected column while retaining only the selected worksheet and preserving the approved workbook features.
