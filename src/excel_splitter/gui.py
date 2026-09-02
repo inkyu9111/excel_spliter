@@ -60,6 +60,7 @@ class ExcelSplitterGui:
 
         self._build()
         self._render_state(controller.state)
+        self.output_var.trace_add("write", self._output_changed)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self.poll_queue)
 
@@ -75,8 +76,8 @@ class ExcelSplitterGui:
         frame.rowconfigure(5, weight=1)
 
         ttk.Label(frame, text="원본 파일").grid(row=0, column=0, sticky="w", pady=3)
-        source_entry = ttk.Entry(frame, textvariable=self.source_var, state="readonly")
-        source_entry.grid(row=0, column=1, sticky="ew", padx=6)
+        self.source_entry = ttk.Entry(frame, textvariable=self.source_var, state="readonly")
+        self.source_entry.grid(row=0, column=1, sticky="ew", padx=6)
         source_button = ttk.Button(frame, text="찾아보기", command=self._browse_source)
         source_button.grid(row=0, column=2)
 
@@ -100,8 +101,8 @@ class ExcelSplitterGui:
         self.pattern_entry.bind("<KeyRelease>", self._pattern_changed)
 
         ttk.Label(frame, text="출력 폴더").grid(row=4, column=0, sticky="w", pady=3)
-        output_entry = ttk.Entry(frame, textvariable=self.output_var, state="readonly")
-        output_entry.grid(row=4, column=1, sticky="ew", padx=6)
+        self.output_entry = ttk.Entry(frame, textvariable=self.output_var)
+        self.output_entry.grid(row=4, column=1, sticky="ew", padx=6)
         output_button = ttk.Button(frame, text="찾아보기", command=self._browse_output)
         output_button.grid(row=4, column=2)
 
@@ -138,6 +139,7 @@ class ExcelSplitterGui:
                 self.sheet_combo,
                 self.column_combo,
                 self.pattern_entry,
+                self.output_entry,
                 output_button,
                 self.preview_button,
                 self.split_button,
@@ -178,6 +180,15 @@ class ExcelSplitterGui:
         if not selected:
             return
         self.controller.select_output_dir(Path(selected))
+        self._clear_preview()
+        self._render_state(self.controller.state)
+
+    def _output_changed(self, *_: object) -> None:
+        raw = self.output_var.get()
+        output_dir = Path(raw) if raw else None
+        if output_dir == self.controller.state.output_dir:
+            return
+        self.controller.select_output_dir(output_dir)
         self._clear_preview()
         self._render_state(self.controller.state)
 
@@ -309,7 +320,9 @@ class ExcelSplitterGui:
 
     def _render_state(self, state: UiState) -> None:
         self.source_var.set(str(state.source) if state.source else "")
-        self.output_var.set(str(state.output_dir) if state.output_dir else "")
+        raw_output = self.output_var.get()
+        if (Path(raw_output) if raw_output else None) != state.output_dir:
+            self.output_var.set(str(state.output_dir) if state.output_dir else "")
         self.sheet_combo.configure(values=state.sheets)
         self.column_combo.configure(values=state.columns)
         self.sheet_var.set(state.sheet_name or "")

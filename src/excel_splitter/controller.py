@@ -51,7 +51,7 @@ class AppController:
         self.state = replace(self.state, column_name=column_name, preview=None)
         return self.state
 
-    def select_output_dir(self, output_dir: Path) -> UiState:
+    def select_output_dir(self, output_dir: Path | None) -> UiState:
         self.state = replace(self.state, output_dir=output_dir, preview=None)
         return self.state
 

@@ -6,6 +6,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .compare_service import CompareService
 from .controller import AppController
+from .etc_service import EtcService
 from .gui import ExcelSplitterGui
 from .merge_service import MergePreview, MergeService
 from .naming import _unique_filename
@@ -16,15 +17,21 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
 
     def __init__(self, root: tk.Tk, controller: AppController,
                  merge_service: MergeService | None = None,
-                 compare_service: CompareService | None = None) -> None:
+                 compare_service: CompareService | None = None,
+                 etc_service: EtcService | None = None) -> None:
         self.merge_service = merge_service if merge_service is not None else MergeService()
         self.compare_service = compare_service if compare_service is not None else CompareService()
+        self.etc_service = etc_service if etc_service is not None else EtcService()
         self.compare_tables = ((), ())
         self.merge_sources: list[Path] = []
         self.merge_preview: MergePreview | None = None
         super().__init__(root, controller)
+        self.merge_output_var.trace_add("write", self._merge_output_changed)
+        self.compare_output_var.trace_add("write", self._compare_output_changed)
+        self.etc_output_var.trace_add("write", self._etc_output_changed)
         self._render_merge_state()
         self._render_compare_state()
+        self._render_etc_state()
 
     def _build(self) -> None:
         self.notebook = ttk.Notebook(self.root)
@@ -71,10 +78,11 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         output.columnconfigure(1, weight=1)
         self.merge_output_var = tk.StringVar()
         ttk.Label(output, text="결과 파일").grid(row=0, column=0)
-        ttk.Entry(output, textvariable=self.merge_output_var, state="readonly").grid(row=0, column=1, sticky="ew", padx=6)
+        self.merge_output_entry = ttk.Entry(output, textvariable=self.merge_output_var)
+        self.merge_output_entry.grid(row=0, column=1, sticky="ew", padx=6)
         browse = ttk.Button(output, text="찾아보기", command=self._browse_merge_output)
         browse.grid(row=0, column=2)
-        self._merge_widgets.append(browse)
+        self._merge_widgets.extend((self.merge_output_entry, browse))
         self.merge_progress = ttk.Progressbar(page, variable=self.progress_var, maximum=1)
         self.merge_progress.grid(row=5, column=0, sticky="ew", pady=(8, 3))
         self.merge_status_var = tk.StringVar(value="병합할 파일을 두 개 이상 추가하세요.")
@@ -88,6 +96,91 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._merge_widgets.extend((self.merge_preview_button, self.merge_button))
         self._input_widgets.extend(self._merge_widgets)
         self._build_compare()
+        self._build_etc()
+
+    def _build_etc(self) -> None:
+        page = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(page, text="기타 (Etc)")
+        page.columnconfigure(1, weight=1)
+        ttk.Label(page, text="한 파일에서 선택한 시트를 정리합니다. 원본은 유지하고 새 파일로 저장합니다.",
+                  wraplength=700).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
+        self.etc_source_var = tk.StringVar()
+        self.etc_sheet_var = tk.StringVar()
+        self.etc_output_var = tk.StringVar()
+        self.etc_remove_artifacts_var = tk.BooleanVar(value=False)
+        self.etc_reset_fill_var = tk.BooleanVar(value=False)
+        ttk.Label(page, text="원본 파일").grid(row=1, column=0, sticky="w")
+        ttk.Entry(page, textvariable=self.etc_source_var, state="readonly").grid(row=1, column=1, sticky="ew", padx=8)
+        browse = ttk.Button(page, text="찾아보기", command=self._browse_etc_source)
+        browse.grid(row=1, column=2)
+        ttk.Label(page, text="워크시트").grid(row=2, column=0, sticky="w", pady=8)
+        self.etc_sheet_combo = ttk.Combobox(page, textvariable=self.etc_sheet_var, state="disabled")
+        self.etc_sheet_combo.grid(row=2, column=1, sticky="ew", padx=8)
+        self.etc_sheet_combo.bind("<<ComboboxSelected>>", lambda _: self._render_etc_state())
+        self._input_widgets.extend((browse, self.etc_sheet_combo))
+        for row, (label, variable) in enumerate((
+            ("모든 도형·메모·댓글 삭제 (그림, 차트, 버튼 포함)", self.etc_remove_artifacts_var),
+            ("셀 채우기색 초기화 (표 스타일·조건부 서식 유지)", self.etc_reset_fill_var),
+        ), 3):
+            checkbox = ttk.Checkbutton(page, text=label, variable=variable, command=self._render_etc_state)
+            checkbox.grid(row=row, column=0, columnspan=3, sticky="w", pady=6)
+            self._input_widgets.append(checkbox)
+        ttk.Label(page, text="직접 지정한 채우기색만 제거하며 글자색, 테두리, 수식, 값은 유지합니다.",
+                  wraplength=700).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 14))
+        ttk.Label(page, text="결과 파일").grid(row=6, column=0, sticky="w")
+        self.etc_output_entry = ttk.Entry(page, textvariable=self.etc_output_var)
+        self.etc_output_entry.grid(row=6, column=1, sticky="ew", padx=8)
+        output = ttk.Button(page, text="찾아보기", command=self._browse_etc_output)
+        output.grid(row=6, column=2)
+        self._input_widgets.extend((self.etc_output_entry, output))
+        self.etc_progress = ttk.Progressbar(page, variable=self.progress_var, maximum=1)
+        self.etc_progress.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(16, 6))
+        self.etc_status_var = tk.StringVar(value="파일을 불러온 뒤 시트와 작업을 선택하세요.")
+        ttk.Label(page, textvariable=self.etc_status_var, wraplength=700).grid(row=8, column=0, columnspan=3, sticky="w")
+        self.etc_button = ttk.Button(page, text="실행 및 저장", command=self._run_etc)
+        self.etc_button.grid(row=9, column=2, sticky="e", pady=12)
+        self._input_widgets.append(self.etc_button)
+
+    def _render_etc_state(self) -> None:
+        ready = all((self.etc_source_var.get(), self.etc_sheet_var.get(), self.etc_output_var.get()))
+        ready = ready and (self.etc_remove_artifacts_var.get() or self.etc_reset_fill_var.get())
+        self.etc_sheet_combo.configure(state="readonly" if self.etc_sheet_combo["values"] and not self._busy else "disabled")
+        self.etc_button.configure(state="normal" if ready and not self._busy else "disabled")
+
+    def _browse_etc_source(self) -> None:
+        selected = filedialog.askopenfilename(parent=self.root, title="정리할 Excel 파일 선택",
+                                              filetypes=(("Excel 통합문서", "*.xlsx"),))
+        if not selected:
+            return
+        source = Path(selected).resolve()
+        self.etc_source_var.set(str(source))
+        self.etc_sheet_combo.configure(values=())
+        self.etc_sheet_var.set("")
+        filename = _unique_filename(f"{source.stem}_정리결과", {p.name.casefold() for p in source.parent.iterdir()})
+        self.etc_output_var.set(str(source.parent / filename))
+        self._start_worker(lambda: ("etc_source", self.etc_service.inspect_source(source)))
+
+    def _browse_etc_output(self) -> None:
+        current = Path(self.etc_output_var.get() or "정리결과.xlsx")
+        selected = filedialog.asksaveasfilename(
+            parent=self.root, title="정리 결과를 저장할 새 파일", initialdir=str(current.parent),
+            initialfile=current.name, defaultextension=".xlsx",
+            filetypes=(("Excel 통합문서", "*.xlsx"),), confirmoverwrite=False,
+        )
+        if selected:
+            self.etc_output_var.set(selected)
+
+    def _etc_output_changed(self, *_: object) -> None:
+        self._render_etc_state()
+
+    def _run_etc(self) -> None:
+        source, target = Path(self.etc_source_var.get()), Path(self.etc_output_var.get())
+        sheet_name = self.etc_sheet_var.get()
+        remove_artifacts, reset_fill = self.etc_remove_artifacts_var.get(), self.etc_reset_fill_var.get()
+        self._start_worker(lambda: ("etc_execute", self.etc_service.execute(
+            source, sheet_name, target, remove_artifacts=remove_artifacts, reset_fill=reset_fill,
+            progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
+        )))
 
     def _build_compare(self) -> None:
         page = ttk.Frame(self.notebook, padding=12)
@@ -106,7 +199,11 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             ("결과 파일", self.compare_output_var, self._browse_compare_output),
         ), 2):
             ttk.Label(page, text=label).grid(row=row, column=0, sticky="w", pady=6)
-            ttk.Entry(page, textvariable=variable, state="readonly").grid(row=row, column=1, sticky="ew", padx=8)
+            entry = ttk.Entry(page, textvariable=variable, state="normal" if variable is self.compare_output_var else "readonly")
+            entry.grid(row=row, column=1, sticky="ew", padx=8)
+            if variable is self.compare_output_var:
+                self.compare_output_entry = entry
+                self._input_widgets.append(entry)
             button = ttk.Button(page, text="찾아보기", command=action)
             button.grid(row=row, column=2)
             self._input_widgets.append(button)
@@ -214,7 +311,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         )
         if selected:
             self.compare_output_var.set(selected)
-            self._render_compare_state()
+
+    def _compare_output_changed(self, *_: object) -> None:
+        self._render_compare_state()
 
     def _compare(self) -> None:
         reference = Path(self.compare_reference_var.get())
@@ -284,7 +383,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
                                               defaultextension=".xlsx", filetypes=(("Excel 통합문서", "*.xlsx"),), confirmoverwrite=False)
         if selected:
             self.merge_output_var.set(selected)
-            self._invalidate_merge_preview()
+
+    def _merge_output_changed(self, *_: object) -> None:
+        self._invalidate_merge_preview()
 
     def _preview_merge(self) -> None:
         sources = tuple(self.merge_sources)
@@ -316,12 +417,23 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             self._reset_progress()
             self.merge_status_var.set("처리 중입니다...")
             self.compare_status_var.set("처리 중입니다...")
+            self.etc_status_var.set("처리 중입니다...")
         self._render_merge_state()
         self._render_compare_state()
+        self._render_etc_state()
 
     def _handle_ok(self, payload: object) -> None:
         tag, value = payload
-        if tag == "compare_tables":
+        if tag == "etc_source":
+            self.etc_sheet_combo.configure(values=value)
+            self.etc_sheet_var.set(value[0] if value else "")
+            self._set_busy(False)
+            self.etc_status_var.set("정리할 시트와 작업을 선택하고 실행 및 저장을 누르세요.")
+        elif tag == "etc_execute":
+            self._set_busy(False)
+            self.etc_status_var.set(f"정리 완료: {value}")
+            messagebox.showinfo("시트 정리 결과", f"선택한 작업을 적용한 새 파일을 저장했습니다.\n{value}", parent=self.root)
+        elif tag == "compare_tables":
             self.compare_tables = value
             for combo, tables in zip((self.compare_reference_table_combo, self.compare_comparison_table_combo), value):
                 combo.configure(values=tuple(f"{table.sheet_name} / {table.table_name}" for table in tables))
@@ -364,11 +476,14 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             self.merge_status_var.set("오류가 발생했습니다. 파일과 설정을 확인한 뒤 미리보기를 다시 실행하세요.")
         elif selected == 2:
             self.compare_status_var.set("오류가 발생했습니다. 파일·표·키 컬럼과 새 결과 파일의 경로를 확인하세요.")
+        elif selected == 3:
+            self.etc_status_var.set("오류가 발생했습니다. 파일·시트·작업과 새 결과 파일의 경로를 확인하세요.")
 
     def _reset_progress(self) -> None:
         super()._reset_progress()
         self.merge_progress.configure(maximum=1)
         self.compare_progress.configure(maximum=1)
+        self.etc_progress.configure(maximum=1)
 
     def _show_progress(self, completed: int, total: int, label: str) -> None:
         super()._show_progress(completed, total, label)
@@ -376,3 +491,5 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_status_var.set(f"처리 중: {label} ({completed}/{total})")
         self.compare_progress.configure(maximum=max(total, 1))
         self.compare_status_var.set(f"처리 중: {label} ({completed}/{total})")
+        self.etc_progress.configure(maximum=max(total, 1))
+        self.etc_status_var.set(f"처리 중: {label} ({completed}/{total})")

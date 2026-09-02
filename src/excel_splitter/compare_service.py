@@ -39,7 +39,7 @@ def _validate_paths(reference: Path, comparison: Path, target: Path) -> None:
     for source in (reference, comparison):
         _validate_source_path(source)
         if _same_file(source, target):
-            raise WorkbookValidationError("비교 결과는 원본과 다른 새 파일에 저장해야 합니다.")
+            raise WorkbookValidationError("결과는 원본과 다른 새 파일에 저장해야 합니다.")
     _validate_output_dir(target.parent)
     if (
         target.suffix.casefold() != ".xlsx"
@@ -47,11 +47,11 @@ def _validate_paths(reference: Path, comparison: Path, target: Path) -> None:
         or _INVALID_CHARACTERS.search(target.name)
         or target.name.rstrip(" .") != target.name
     ):
-        raise WorkbookValidationError("비교 결과에 유효한 .xlsx 파일명을 지정하세요.")
+        raise WorkbookValidationError("결과에 유효한 .xlsx 파일명을 지정하세요.")
     if target.exists() or target.is_symlink():
-        raise WorkbookValidationError("비교 결과 파일이 이미 존재합니다. 새 파일명을 지정하세요.")
+        raise WorkbookValidationError("결과 파일이 이미 존재합니다. 새 파일명을 지정하세요.")
     if max(len(str(target)), len(str(target.parent / ".ec-00000000.xlsx"))) > 218:
-        raise WorkbookValidationError("비교 결과 또는 Excel 임시 경로는 218자를 넘을 수 없습니다.")
+        raise WorkbookValidationError("결과 또는 Excel 임시 경로는 218자를 넘을 수 없습니다.")
 
 
 class CompareService:
@@ -258,7 +258,7 @@ def _save_comparison(workbook: Any, temp: Path) -> None:
         ReadOnlyRecommended=False, AddToMru=False,
     )
     if Path(str(workbook.FullName)).resolve() != temp:
-        raise SplitExecutionError("비교 결과가 지정한 임시 경로에 저장되지 않았습니다.")
+        raise SplitExecutionError("결과가 지정한 임시 경로에 저장되지 않았습니다.")
 
 
 def _write_key_comparison(

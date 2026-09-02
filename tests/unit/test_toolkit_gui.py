@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from dataclasses import replace
 import logging
 import tkinter as tk
 
@@ -256,3 +257,154 @@ def test_key_compare_switching_table_or_file_clears_keys_and_position_mode_stays
     gui._compare_mode_changed()
     assert str(gui.compare_button["state"]) == "normal"
     assert str(gui.compare_key_list["state"]) == "disabled"
+
+
+def test_etc_loads_sheets_and_saves_selected_operations_to_new_file(toolkit, monkeypatch, tmp_path):
+    gui, _ = toolkit
+    gui.notebook.select(3)
+    source = tmp_path / "source.xlsx"
+    (tmp_path / "source_정리결과.xlsx").touch()
+    output = tmp_path / "source_정리결과 (2).xlsx"
+    calls = []
+
+    def inspect_source(path):
+        assert path == source
+        return ("Keep", "Clean")
+
+    def execute(path, sheet_name, target, *, remove_artifacts, reset_fill, progress):
+        calls.append((path, sheet_name, target, remove_artifacts, reset_fill))
+        progress(1, 1, sheet_name)
+        return target
+
+    gui.etc_service = SimpleNamespace(inspect_source=inspect_source, execute=execute)
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.askopenfilename", lambda **_: str(source))
+    gui._browse_etc_source()
+    assert all(gui.notebook.tab(index, "state") == "disabled" for index in range(3))
+    complete_worker(gui)
+    assert tuple(gui.etc_sheet_combo["values"]) == ("Keep", "Clean")
+    assert Path(gui.etc_output_var.get()) == output
+    assert str(gui.etc_button["state"]) == "disabled"
+    gui.etc_sheet_var.set("Clean")
+    gui.etc_remove_artifacts_var.set(True)
+    gui.etc_reset_fill_var.set(True)
+    gui._render_etc_state()
+    assert str(gui.etc_button["state"]) == "normal"
+    messages = []
+    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda _, text, **__: messages.append(text))
+    gui._run_etc()
+    assert str(gui.etc_sheet_combo["state"]) == "disabled"
+    assert str(gui.etc_button["state"]) == "disabled"
+    complete_worker(gui)
+    assert calls == [(source, "Clean", output, True, True)]
+    assert str(output) in messages[0]
+    assert all(gui.notebook.tab(index, "state") == "normal" for index in range(3))
+
+
+def test_etc_options_work_independently_and_new_file_clears_stale_sheets(toolkit, monkeypatch, tmp_path):
+    from excel_splitter.errors import WorkbookValidationError
+
+    gui, _ = toolkit
+    gui.notebook.select(3)
+    gui.etc_source_var.set(str(tmp_path / "first.xlsx"))
+    gui.etc_output_var.set(str(tmp_path / "result.xlsx"))
+    gui._handle_ok(("etc_source", ("Old",)))
+    calls = []
+
+    def execute(source, sheet_name, target, **options):
+        calls.append((options["remove_artifacts"], options["reset_fill"]))
+        return target
+
+    gui.etc_service = SimpleNamespace(execute=execute, inspect_source=lambda _: ("New",))
+    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda *_, **__: None)
+    for remove, reset in ((True, False), (False, True)):
+        gui.etc_remove_artifacts_var.set(remove)
+        gui.etc_reset_fill_var.set(reset)
+        gui._render_etc_state()
+        assert str(gui.etc_button["state"]) == "normal"
+        gui._run_etc()
+        complete_worker(gui)
+    assert calls == [(True, False), (False, True)]
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.askopenfilename", lambda **_: str(tmp_path / "second.xlsx"))
+    gui._browse_etc_source()
+    assert gui.etc_sheet_var.get() == ""
+    assert str(gui.etc_button["state"]) == "disabled"
+    complete_worker(gui)
+    assert tuple(gui.etc_sheet_combo["values"]) == ("New",)
+    chosen = tmp_path / "custom.xlsx"
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.asksaveasfilename", lambda **_: str(chosen))
+    gui._browse_etc_output()
+    assert Path(gui.etc_output_var.get()) == chosen
+    gui._set_busy(True)
+    monkeypatch.setattr("excel_splitter.gui.messagebox.showerror", lambda *_, **__: None)
+    gui._handle_error(WorkbookValidationError("protected sheet"))
+    assert not gui._busy and "오류" in gui.etc_status_var.get()
+    assert str(gui.etc_button["state"]) == "normal"
+
+
+def test_output_entries_edit_state_without_key_events(toolkit, monkeypatch, tmp_path):
+    gui, calls = toolkit
+    split_output = tmp_path / "split-output"
+    gui.controller.state = replace(
+        gui.controller.state,
+        source=tmp_path / "source.xlsx",
+        sheet_name="Data",
+        column_name="Team",
+        output_dir=split_output,
+        preview=object(),
+    )
+    gui._render_state(gui.controller.state)
+
+    gui.output_entry.delete(0, "end")
+    assert gui.output_var.get() == ""
+    assert gui.controller.state.output_dir is None
+    assert gui.controller.state.preview is None
+    assert str(gui.preview_button["state"]) == "disabled"
+
+    trailing_output = f"{split_output}\\"
+    gui.output_entry.insert(0, trailing_output)
+    assert gui.output_var.get() == trailing_output
+    assert gui.controller.state.output_dir == split_output
+
+    add_files(gui, monkeypatch)
+    gui.merge_preview = SimpleNamespace()
+    gui._render_merge_state()
+    merge_output = tmp_path / "manual-merge.xlsx"
+    gui.merge_output_entry.delete(0, "end")
+    gui.merge_output_entry.insert(0, str(merge_output))
+    assert gui.merge_preview is None
+    gui._preview_merge()
+    complete_worker(gui)
+    assert calls[-1][1] == merge_output
+
+
+def test_output_entries_update_readiness_and_busy_state(toolkit, tmp_path):
+    gui, _ = toolkit
+    assert str(gui.source_entry["state"]) == "readonly"
+    assert all(str(entry["state"]) == "normal" for entry in (
+        gui.output_entry, gui.merge_output_entry, gui.compare_output_entry, gui.etc_output_entry,
+    ))
+
+    gui.compare_reference_var.set(str(tmp_path / "reference.xlsx"))
+    gui.compare_comparison_var.set(str(tmp_path / "comparison.xlsx"))
+    gui.compare_output_entry.insert(0, str(tmp_path / "compare.xlsx"))
+    assert str(gui.compare_button["state"]) == "normal"
+    gui.compare_output_entry.delete(0, "end")
+    assert str(gui.compare_button["state"]) == "disabled"
+
+    gui.etc_source_var.set(str(tmp_path / "source.xlsx"))
+    gui.etc_sheet_var.set("Data")
+    gui.etc_remove_artifacts_var.set(True)
+    gui.etc_output_entry.insert(0, str(tmp_path / "etc.xlsx"))
+    assert str(gui.etc_button["state"]) == "normal"
+    gui.etc_output_entry.delete(0, "end")
+    assert str(gui.etc_button["state"]) == "disabled"
+
+    gui._set_busy(True)
+    assert all(str(entry["state"]) == "disabled" for entry in (
+        gui.output_entry, gui.merge_output_entry, gui.compare_output_entry, gui.etc_output_entry,
+    ))
+    gui._set_busy(False)
+    assert all(str(entry["state"]) == "normal" for entry in (
+        gui.output_entry, gui.merge_output_entry, gui.compare_output_entry, gui.etc_output_entry,
+    ))
+    assert str(gui.source_entry["state"]) == "readonly"
