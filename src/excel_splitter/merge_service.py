@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .errors import SplitExecutionError, WorkbookValidationError
+from .excel_artifacts import unsupported_threaded_comments_error
 from .excel_gateway import (
+    _bulk_contains_value,
     _close_without_saving,
     _excel_session,
     _open_workbook,
     _publish_temp,
     _single_table,
-    _validate_below_table,
 )
 from .file_signature import capture_signature, same_signature
 from .models import FileSignature
@@ -92,15 +93,27 @@ class MergeService:
         prior = capture_signature(target) if target.exists() else None
         inputs: list[MergeInput] = []
         with _excel_session() as excel:
-            for source in sources:
+            # Inspect the template last so expansion needs no reopen or concurrent books.
+            for source in sources[1:] + sources[:1]:
                 signature = capture_signature(source)
-                item = _inspect_source(excel, source, signature, template=not inputs)
-                if inputs and item.columns != inputs[0].columns:
-                    raise WorkbookValidationError(f"Table 열 이름과 순서가 다릅니다: {source.name}")
-                inputs.append(item)
-        total = sum(item.row_count for item in inputs)
-        if inputs[0].header_row + total + int(inputs[0].has_totals) > 1_048_576:
-            raise WorkbookValidationError("병합 결과가 Excel 워크시트 행 한도를 초과합니다.")
+                workbook = _open_workbook(excel, source, read_only=True)
+                try:
+                    item = _inspect_source(workbook, source, signature)
+                    if source != sources[0]:
+                        inputs.append(item)
+                        continue
+                    inputs.insert(0, item)
+                    for other in inputs[1:]:
+                        if other.columns != item.columns:
+                            raise WorkbookValidationError(f"Table 열 이름과 순서가 다릅니다: {other.source.name}")
+                    total = sum(item.row_count for item in inputs)
+                    if item.header_row + total + int(item.has_totals) > 1_048_576:
+                        raise WorkbookValidationError("병합 결과가 Excel 워크시트 행 한도를 초과합니다.")
+                    if total > item.row_count:
+                        sheet, table = _merge_table(workbook)
+                        _validate_merge_expansion(sheet, table, total)
+                finally:
+                    _close_without_saving(workbook)
         preview = MergePreview(tuple(inputs), target, prior, total)
         _validate_unchanged(preview)
         return preview
@@ -130,19 +143,17 @@ class MergeService:
                 raise SplitExecutionError(f"병합 임시 파일을 삭제하지 못했습니다: {temp}; {active_error or exc}") from exc
 
 
-def _inspect_source(excel: Any, source: Path, signature: FileSignature, *, template: bool) -> MergeInput:
-    workbook = _open_workbook(excel, source, read_only=True)
-    try:
-        sheet, table = _merge_table(workbook)
-        if template:
-            _validate_below_table(sheet, table)
-        return MergeInput(
-            source, signature, str(sheet.Name), str(table.Name),
-            tuple(str(table.ListColumns.Item(index).Name) for index in range(1, table.ListColumns.Count + 1)),
-            int(table.ListRows.Count), int(table.HeaderRowRange.Row), bool(table.ShowTotals),
-        )
-    finally:
-        _close_without_saving(workbook)
+def _table_headers(table: Any) -> tuple[str, ...]:
+    values = table.HeaderRowRange.Value2
+    return tuple(str(value) for value in (values[0] if isinstance(values, tuple) else (values,)))
+
+
+def _inspect_source(workbook: Any, source: Path, signature: FileSignature) -> MergeInput:
+    sheet, table = _merge_table(workbook)
+    return MergeInput(
+        source, signature, str(sheet.Name), str(table.Name), _table_headers(table),
+        int(table.ListRows.Count), int(table.HeaderRowRange.Row), bool(table.ShowTotals),
+    )
 
 
 def _merge_table(workbook: Any) -> tuple[Any, Any]:
@@ -159,6 +170,37 @@ def _merge_table(workbook: Any) -> tuple[Any, Any]:
     return sheet, table
 
 
+def _validate_merge_expansion(sheet: Any, table: Any, row_count: int) -> None:
+    first_row = int(table.Range.Row) + int(table.Range.Rows.Count)
+    last_row = int(table.HeaderRowRange.Row) + row_count + int(table.ShowTotals)
+    if first_row > last_row:
+        return
+    first_column = int(table.Range.Column)
+    last_column = first_column + int(table.Range.Columns.Count) - 1
+    bounded = sheet.Range(sheet.Cells(first_row, first_column), sheet.Cells(last_row, last_column))
+    message = "병합 Table 확장 범위에 덮어쓸 수 없는 콘텐츠가 있습니다."
+    if (
+        _bulk_contains_value(bounded.Value2)
+        or _bulk_contains_value(bounded.Formula)
+        or bounded.MergeCells != False  # None denotes a mix of merged and unmerged cells.
+        or int(bounded.Hyperlinks.Count) > 0
+    ):
+        raise WorkbookValidationError(message)
+    # Formatting alone is safe; inspect only actual comment anchors, not every cell.
+    for name in ("Comments", "CommentsThreaded"):
+        try:
+            comments = getattr(sheet, name)
+            count = int(comments.Count)
+        except Exception as exc:
+            if name == "CommentsThreaded" and unsupported_threaded_comments_error(exc):
+                continue
+            raise
+        for index in range(1, count + 1):
+            anchor = comments.Item(index).Parent
+            if first_row <= int(anchor.Row) <= last_row and first_column <= int(anchor.Column) <= last_column:
+                raise WorkbookValidationError(message)
+
+
 def _write_merged(temp: Path, preview: MergePreview, progress: ProgressCallback) -> None:
     with _excel_session() as excel:
         workbook = _open_workbook(excel, temp, read_only=False)
@@ -167,22 +209,31 @@ def _write_merged(temp: Path, preview: MergePreview, progress: ProgressCallback)
             if sheet.FilterMode:
                 sheet.ShowAllData()
             columns = len(preview.inputs[0].columns)
+            header_row = int(table.HeaderRowRange.Row)
+            first_column = int(table.Range.Column)
+            last_column = first_column + columns - 1
             if int(table.ListRows.Count) != preview.row_count:
-                table.Resize(table.HeaderRowRange.Resize(
-                    preview.row_count + 1 + int(table.ShowTotals), columns
+                _validate_merge_expansion(sheet, table, preview.row_count)
+                # Range.Resize is an optional-argument COM property; use explicit cells.
+                table.Resize(sheet.Range(
+                    sheet.Cells(header_row, first_column),
+                    sheet.Cells(header_row + preview.row_count + int(table.ShowTotals), last_column),
                 ))
             offset = 0
             for completed, item in enumerate(preview.inputs, 1):
                 source = _open_workbook(excel, item.source, read_only=True)
                 try:
                     source_sheet, source_table = _merge_table(source)
-                    headers = tuple(str(source_table.ListColumns.Item(index).Name) for index in range(1, source_table.ListColumns.Count + 1))
+                    headers = _table_headers(source_table)
                     if headers != item.columns or int(source_table.ListRows.Count) != item.row_count:
                         raise WorkbookValidationError(f"원본 Table이 미리보기와 다릅니다: {item.source.name}")
                     if source_sheet.FilterMode:
                         source_sheet.ShowAllData()
                     if item.row_count:
-                        destination = table.DataBodyRange.Cells(offset + 1, 1).Resize(item.row_count, columns)
+                        destination = sheet.Range(
+                            sheet.Cells(header_row + offset + 1, first_column),
+                            sheet.Cells(header_row + offset + item.row_count, last_column),
+                        )
                         source_table.DataBodyRange.Copy()
                         destination.PasteSpecial(Paste=-4122)  # xlPasteFormats
                         destination.PasteSpecial(Paste=12)  # xlPasteValuesAndNumberFormats
