@@ -5,7 +5,7 @@ import tkinter as tk
 
 from .controller import AppController
 from .excel_gateway import ExcelComGateway
-from .gui import ExcelSplitterGui
+from .toolkit_gui import ExcelFileToolkitGui
 from .ports import SplitServicePort
 from .split_service import SplitService
 
@@ -27,7 +27,7 @@ def main(service: SplitServicePort | None = None) -> None:
     else:
         concrete = service
     root = tk.Tk()
-    ExcelSplitterGui(root, AppController(concrete))
+    ExcelFileToolkitGui(root, AppController(concrete))
     if gateway is not None:
         threading.Thread(
             target=_prewarm_gateway,

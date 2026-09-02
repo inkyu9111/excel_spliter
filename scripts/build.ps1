@@ -10,7 +10,7 @@ $ProjectMarker = Join-Path $ProjectRoot "pyproject.toml"
 $EntryPoint = Join-Path $ProjectRoot "src\excel_splitter\__main__.py"
 if (-not (Test-Path -LiteralPath $ProjectMarker -PathType Leaf) -or
     -not (Test-Path -LiteralPath $EntryPoint -PathType Leaf)) {
-    throw "Could not validate the ExcelSplitter project root: $ProjectRoot"
+    throw "Could not validate the Excel File Toolkit project root: $ProjectRoot"
 }
 
 function Invoke-Checked {
@@ -42,12 +42,13 @@ $PythonComBinary = "$PythonComDll;pywin32_system32"
 
 Invoke-Checked {
     & $PythonExe -m PyInstaller --noconfirm --clean --onedir --windowed `
-        --name ExcelSplitter --paths src --add-binary $PythonComBinary `
+        --name ExcelFileToolkit --paths src --add-binary $PythonComBinary `
+        --workpath build\toolkit-onedir --distpath build\toolkit-preview `
         src/excel_splitter/__main__.py
 } "One-folder build"
 
-$OnedirPath = (Join-Path $ProjectRoot "dist\ExcelSplitter")
-$OnedirExe = Join-Path $OnedirPath "ExcelSplitter.exe"
+$OnedirPath = (Join-Path $ProjectRoot "build\toolkit-preview\ExcelFileToolkit")
+$OnedirExe = Join-Path $OnedirPath "ExcelFileToolkit.exe"
 if (-not (Test-Path -LiteralPath $OnedirExe -PathType Leaf)) {
     throw "One-folder executable was not created: $OnedirExe"
 }
@@ -56,7 +57,7 @@ $OnedirPythonCom = Get-ChildItem -LiteralPath $OnedirPath -Recurse -File `
 if (-not $OnedirPythonCom) {
     throw "One-folder build omitted the pythoncom native DLL."
 }
-$Probe = Start-Process -FilePath $OnedirExe -PassThru
+$Probe = Start-Process -FilePath $OnedirExe -WindowStyle Hidden -PassThru
 Start-Sleep -Seconds 2
 if ($Probe.HasExited) {
     throw "One-folder executable exited during startup verification."
@@ -66,19 +67,13 @@ if (-not $Probe.WaitForExit(3000)) {
     Stop-Process -Id $Probe.Id
 }
 
-$BuildPath = Join-Path $ProjectRoot "build\ExcelSplitter"
-Remove-Item -LiteralPath $OnedirPath -Recurse -Force
-if (Test-Path -LiteralPath $BuildPath) {
-    Remove-Item -LiteralPath $BuildPath -Recurse -Force
-}
-
 Invoke-Checked {
     & $PythonExe -m PyInstaller --noconfirm --clean --onefile --windowed `
-        --name ExcelSplitter --paths src --add-binary $PythonComBinary `
+        --name ExcelFileToolkit --paths src --add-binary $PythonComBinary `
         src/excel_splitter/__main__.py
 } "One-file build"
 
-$FinalExe = Join-Path $ProjectRoot "dist\ExcelSplitter.exe"
+$FinalExe = Join-Path $ProjectRoot "dist\ExcelFileToolkit.exe"
 if (-not (Test-Path -LiteralPath $FinalExe -PathType Leaf)) {
     throw "Final executable was not created: $FinalExe"
 }

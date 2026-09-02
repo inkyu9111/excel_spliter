@@ -27,10 +27,10 @@ def configure_logging() -> logging.Logger:
     if logger.handlers:
         return logger
     local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-    log_dir = local_app_data / "ExcelSplitter" / "logs"
+    log_dir = local_app_data / "ExcelFileToolkit" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
-        log_dir / "excel-splitter.log",
+        log_dir / "excel-file-toolkit.log",
         maxBytes=1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -63,13 +63,14 @@ class ExcelSplitterGui:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self.poll_queue)
 
-    def _build(self) -> None:
-        self.root.title("Excel Splitter")
+    def _build(self, parent: tk.Misc | None = None) -> None:
+        self.root.title("Excel File Toolkit")
         self.root.minsize(760, 560)
-        frame = ttk.Frame(self.root, padding=12)
+        parent = parent if parent is not None else self.root
+        frame = ttk.Frame(parent, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(5, weight=1)
 

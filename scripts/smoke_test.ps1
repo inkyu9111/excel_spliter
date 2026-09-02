@@ -92,7 +92,7 @@ Write-Host "Confirm the deleted-sheet-reference warning appears and no orphan Ex
 $Process = Start-Process -FilePath $ExePath -PassThru
 Read-Host "Complete the split in the app, close it, then press Enter"
 if (-not $Process.HasExited) {
-    throw "Close ExcelSplitter before completing the smoke test."
+    throw "Close Excel File Toolkit before completing the smoke test."
 }
 $AfterHash = (Get-FileHash -LiteralPath $WorkbookPath -Algorithm SHA256).Hash
 if ($AfterHash -ne $SourceHash) {

@@ -132,7 +132,7 @@ def test_main_builds_default_service_and_runs_gui(
     )
     monkeypatch.setattr(
         app,
-        "ExcelSplitterGui",
+        "ExcelFileToolkitGui",
         lambda actual_root, actual_controller: events.append(
             (actual_root, actual_controller)
         ),
@@ -166,7 +166,7 @@ def test_main_does_not_prewarm_an_injected_service(
     monkeypatch.setattr(app.tk, "Tk", lambda: root)
     monkeypatch.setattr(app, "AppController", lambda actual: actual)
     monkeypatch.setattr(
-        app, "ExcelSplitterGui", lambda _root, actual: events.append(("gui", actual))
+        app, "ExcelFileToolkitGui", lambda _root, actual: events.append(("gui", actual))
     )
     monkeypatch.setattr(
         app.threading, "Thread", lambda **_kwargs: pytest.fail("must not start")
@@ -194,7 +194,7 @@ def test_main_survives_background_prewarm_failure(
     monkeypatch.setattr(app, "ExcelComGateway", Gateway)
     monkeypatch.setattr(app, "SplitService", lambda gateway: gateway)
     monkeypatch.setattr(app, "AppController", lambda service: service)
-    monkeypatch.setattr(app, "ExcelSplitterGui", lambda *_args: events.append("gui"))
+    monkeypatch.setattr(app, "ExcelFileToolkitGui", lambda *_args: events.append("gui"))
 
     class ImmediateThread:
         def __init__(self, *, target, args, **_kwargs):
