@@ -133,3 +133,126 @@ def test_merge_error_clears_stale_preview_and_restores_controls(toolkit, monkeyp
     assert gui.merge_preview is None
     assert gui.notebook.tab(0, "state") == "normal"
     assert str(gui.merge_preview_button["state"]) == "normal"
+
+
+def test_compare_selection_creates_unused_output_and_saves_result(toolkit, monkeypatch, tmp_path):
+    gui, _ = toolkit
+    gui.notebook.select(2)
+    reference, comparison = tmp_path / "reference.xlsx", tmp_path / "comparison.xlsx"
+    (tmp_path / "comparison_비교결과.xlsx").touch()
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.askopenfilename", lambda **_: str(reference))
+    gui._browse_compare_input("reference")
+    assert str(gui.compare_button["state"]) == "disabled"
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.askopenfilename", lambda **_: str(comparison))
+    gui._browse_compare_input("comparison")
+    output = tmp_path / "comparison_비교결과 (2).xlsx"
+    assert Path(gui.compare_output_var.get()) == output
+    assert str(gui.compare_button["state"]) == "normal"
+
+    def execute(actual_reference, actual_comparison, target, *, progress):
+        assert (actual_reference, actual_comparison, target) == (reference, comparison, output)
+        progress(1, 1, "Data")
+        return SimpleNamespace(target=target, changed_cells=3, missing_sheets=("누락 시트",),
+                               missing_rows=0, missing_columns=())
+
+    gui.compare_service = SimpleNamespace(execute=execute)
+    messages = []
+    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda _, text, **__: messages.append(text))
+    gui._compare()
+    assert gui.notebook.tab(0, "state") == gui.notebook.tab(1, "state") == "disabled"
+    assert str(gui.compare_button["state"]) == "disabled"
+    complete_worker(gui)
+    assert str(output) in messages[0] and "3" in messages[0] and "누락 시트" in messages[0]
+    assert gui.notebook.tab(0, "state") == gui.notebook.tab(1, "state") == "normal"
+    assert str(gui.compare_button["state"]) == "normal"
+
+
+def test_compare_output_browse_and_error_restore_controls(toolkit, monkeypatch, tmp_path):
+    from excel_splitter.errors import WorkbookValidationError
+
+    gui, _ = toolkit
+    gui.notebook.select(2)
+    gui.compare_reference_var.set(str(tmp_path / "reference.xlsx"))
+    gui.compare_comparison_var.set(str(tmp_path / "comparison.xlsx"))
+    output = tmp_path / "custom.xlsx"
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.asksaveasfilename", lambda **_: str(output))
+    gui._browse_compare_output()
+    assert Path(gui.compare_output_var.get()) == output
+    gui._set_busy(True)
+    monkeypatch.setattr("excel_splitter.gui.messagebox.showerror", lambda *_, **__: None)
+    gui._handle_error(WorkbookValidationError("existing output"))
+    assert "오류" in gui.compare_status_var.get()
+    assert not gui._busy and str(gui.compare_button["state"]) == "normal"
+
+
+def test_key_compare_loads_tables_selects_multiple_columns_and_sends_options(toolkit, monkeypatch, tmp_path):
+    gui, _ = toolkit
+    gui.notebook.select(2)
+    reference, comparison, target = (tmp_path / name for name in ("base.xlsx", "other.xlsx", "result.xlsx"))
+    gui.compare_reference_var.set(str(reference))
+    gui.compare_comparison_var.set(str(comparison))
+    gui.compare_output_var.set(str(target))
+    gui.compare_by_key_var.set(True)
+    gui._compare_mode_changed()
+    assert str(gui.compare_button["state"]) == "disabled"
+    tables = (
+        (SimpleNamespace(sheet_name="Base", table_name="BaseTable", columns=("b_col", "c_col", "amount")),),
+        (SimpleNamespace(sheet_name="Other", table_name="OtherTable", columns=("amount", "c_col", "b_col")),),
+    )
+
+    def inspect_tables(actual_reference, actual_comparison):
+        assert (actual_reference, actual_comparison) == (reference, comparison)
+        return tables
+
+    def execute(actual_reference, actual_comparison, actual_target, *, progress, **options):
+        assert (actual_reference, actual_comparison, actual_target) == (reference, comparison, target)
+        assert options == dict(key_columns=("b_col", "c_col"),
+                               reference_table=("Base", "BaseTable"), comparison_table=("Other", "OtherTable"))
+        return SimpleNamespace(target=target, changed_cells=2, missing_sheets=(), missing_rows=3,
+                               missing_columns=("old_amount",))
+
+    gui.compare_service = SimpleNamespace(inspect_tables=inspect_tables, execute=execute)
+    gui._load_compare_tables()
+    assert str(gui.compare_key_list["state"]) == "disabled"
+    complete_worker(gui)
+    assert gui.compare_key_list.get(0, "end") == ("b_col", "c_col", "amount")
+    assert str(gui.compare_button["state"]) == "disabled"
+    gui.compare_key_list.selection_set(0, 1)
+    gui._render_compare_state()
+    assert str(gui.compare_button["state"]) == "normal"
+    messages = []
+    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda _, text, **__: messages.append(text))
+    gui._compare()
+    complete_worker(gui)
+    assert "3" in messages[0] and "old_amount" in messages[0]
+
+
+def test_key_compare_switching_table_or_file_clears_keys_and_position_mode_stays_available(toolkit, monkeypatch, tmp_path):
+    gui, _ = toolkit
+    gui.notebook.select(2)
+    gui.compare_reference_var.set(str(tmp_path / "base.xlsx"))
+    gui.compare_comparison_var.set(str(tmp_path / "other.xlsx"))
+    gui.compare_output_var.set(str(tmp_path / "result.xlsx"))
+    gui.compare_by_key_var.set(True)
+    tables = (
+        (SimpleNamespace(sheet_name="Base", table_name="Table1", columns=("id", "code")),),
+        (SimpleNamespace(sheet_name="Other", table_name="Table2", columns=("id", "code")),
+         SimpleNamespace(sheet_name="Other", table_name="Table3", columns=("code",))),
+    )
+    gui._handle_ok(("compare_tables", tables))
+    gui.compare_key_list.selection_set(0)
+    gui.compare_comparison_table_combo.current(1)
+    gui._refresh_compare_keys()
+    # Missing comparison columns remain selectable, so validation can name the missing key.
+    assert gui.compare_key_list.get(0, "end") == ("id", "code")
+    assert gui.compare_key_list.curselection() == ()
+    assert str(gui.compare_button["state"]) == "disabled"
+    gui.compare_key_list.selection_set(0)
+    monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.askopenfilename", lambda **_: str(tmp_path / "new.xlsx"))
+    gui._browse_compare_input("reference")
+    assert gui.compare_key_list.size() == 0
+    assert str(gui.compare_button["state"]) == "disabled"
+    gui.compare_by_key_var.set(False)
+    gui._compare_mode_changed()
+    assert str(gui.compare_button["state"]) == "normal"
+    assert str(gui.compare_key_list["state"]) == "disabled"

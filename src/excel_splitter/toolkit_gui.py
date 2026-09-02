@@ -4,21 +4,27 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from .compare_service import CompareService
 from .controller import AppController
 from .gui import ExcelSplitterGui
 from .merge_service import MergePreview, MergeService
+from .naming import _unique_filename
 
 
 class ExcelFileToolkitGui(ExcelSplitterGui):
-    """Keep the Split screen and worker lifecycle, adding a separate Merge tab."""
+    """Share the Split worker lifecycle across the toolkit's operation tabs."""
 
     def __init__(self, root: tk.Tk, controller: AppController,
-                 merge_service: MergeService | None = None) -> None:
+                 merge_service: MergeService | None = None,
+                 compare_service: CompareService | None = None) -> None:
         self.merge_service = merge_service if merge_service is not None else MergeService()
+        self.compare_service = compare_service if compare_service is not None else CompareService()
+        self.compare_tables = ((), ())
         self.merge_sources: list[Path] = []
         self.merge_preview: MergePreview | None = None
         super().__init__(root, controller)
         self._render_merge_state()
+        self._render_compare_state()
 
     def _build(self) -> None:
         self.notebook = ttk.Notebook(self.root)
@@ -81,6 +87,154 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_button.grid(row=0, column=1)
         self._merge_widgets.extend((self.merge_preview_button, self.merge_button))
         self._input_widgets.extend(self._merge_widgets)
+        self._build_compare()
+
+    def _build_compare(self) -> None:
+        page = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(page, text="비교 (Compare)")
+        page.columnconfigure(1, weight=1)
+        ttk.Label(page, text="기본은 같은 시트·셀 위치 비교입니다. 키 비교는 선택한 표의 행을 키로 연결합니다.",
+                  wraplength=700).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Label(page, text="다른 셀은 노란색으로 표시한 새 파일에 저장합니다. 원본 파일은 그대로 유지됩니다.",
+                  wraplength=700).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 16))
+        self.compare_reference_var = tk.StringVar()
+        self.compare_comparison_var = tk.StringVar()
+        self.compare_output_var = tk.StringVar()
+        for row, (label, variable, action) in enumerate((
+            ("기준 파일", self.compare_reference_var, lambda: self._browse_compare_input("reference")),
+            ("비교대상 파일", self.compare_comparison_var, lambda: self._browse_compare_input("comparison")),
+            ("결과 파일", self.compare_output_var, self._browse_compare_output),
+        ), 2):
+            ttk.Label(page, text=label).grid(row=row, column=0, sticky="w", pady=6)
+            ttk.Entry(page, textvariable=variable, state="readonly").grid(row=row, column=1, sticky="ew", padx=8)
+            button = ttk.Button(page, text="찾아보기", command=action)
+            button.grid(row=row, column=2)
+            self._input_widgets.append(button)
+        options = ttk.Frame(page)
+        options.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        options.columnconfigure(1, weight=1)
+        self.compare_by_key_var = tk.BooleanVar(value=False)
+        mode = ttk.Checkbutton(options, text="키 컬럼으로 행 비교", variable=self.compare_by_key_var,
+                               command=self._compare_mode_changed)
+        mode.grid(row=0, column=0, sticky="w")
+        self.compare_tables_button = ttk.Button(options, text="표·컬럼 불러오기", command=self._load_compare_tables)
+        self.compare_tables_button.grid(row=0, column=1, sticky="e")
+        self.compare_reference_table_combo = ttk.Combobox(options, state="disabled")
+        self.compare_comparison_table_combo = ttk.Combobox(options, state="disabled")
+        for row, (label, combo) in enumerate((
+            ("기준 표", self.compare_reference_table_combo), ("비교대상 표", self.compare_comparison_table_combo),
+        ), 1):
+            ttk.Label(options, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            combo.grid(row=row, column=1, sticky="ew", padx=(8, 0))
+            combo.bind("<<ComboboxSelected>>", self._refresh_compare_keys)
+        ttk.Label(options, text="키 컬럼 (복수 선택)").grid(row=3, column=0, sticky="nw", pady=3)
+        key_frame = ttk.Frame(options)
+        key_frame.grid(row=3, column=1, sticky="ew", padx=(8, 0))
+        key_frame.columnconfigure(0, weight=1)
+        self.compare_key_list = tk.Listbox(key_frame, selectmode="multiple", exportselection=False, height=4)
+        self.compare_key_list.grid(row=0, column=0, sticky="ew")
+        scrollbar = ttk.Scrollbar(key_frame, orient="vertical", command=self.compare_key_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.compare_key_list.configure(yscrollcommand=scrollbar.set)
+        self.compare_key_list.bind("<<ListboxSelect>>", lambda _: self._render_compare_state())
+        self._input_widgets.extend((mode, self.compare_tables_button, self.compare_reference_table_combo,
+                                    self.compare_comparison_table_combo, self.compare_key_list))
+        self.compare_progress = ttk.Progressbar(page, variable=self.progress_var, maximum=1)
+        self.compare_progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 6))
+        self.compare_status_var = tk.StringVar(value="기준 파일과 비교대상 파일을 선택하세요.")
+        ttk.Label(page, textvariable=self.compare_status_var, wraplength=700).grid(
+            row=7, column=0, columnspan=3, sticky="w")
+        self.compare_button = ttk.Button(page, text="비교 및 저장", command=self._compare)
+        self.compare_button.grid(row=8, column=2, sticky="e", pady=8)
+        self._input_widgets.append(self.compare_button)
+
+    def _render_compare_state(self) -> None:
+        ready = all(variable.get() for variable in (
+            self.compare_reference_var, self.compare_comparison_var, self.compare_output_var,
+        ))
+        key_mode = self.compare_by_key_var.get()
+        enabled = key_mode and not self._busy
+        has_sources = bool(self.compare_reference_var.get() and self.compare_comparison_var.get())
+        self.compare_tables_button.configure(state="normal" if enabled and has_sources else "disabled")
+        for combo, tables in zip((self.compare_reference_table_combo, self.compare_comparison_table_combo), self.compare_tables):
+            combo.configure(state="readonly" if enabled and tables else "disabled")
+        self.compare_key_list.configure(state="normal" if enabled and self.compare_key_list.size() else "disabled")
+        if key_mode:
+            ready = ready and bool(self.compare_key_list.curselection())
+        self.compare_button.configure(state="normal" if ready and not self._busy else "disabled")
+
+    def _compare_mode_changed(self) -> None:
+        self.compare_status_var.set("표·컬럼을 불러온 뒤 키 컬럼을 클릭하여 선택하세요." if self.compare_by_key_var.get()
+                                    else "같은 이름의 시트에서 같은 위치의 셀 값을 비교합니다.")
+        self._render_compare_state()
+
+    def _invalidate_compare_tables(self) -> None:
+        self.compare_tables = ((), ())
+        for combo in (self.compare_reference_table_combo, self.compare_comparison_table_combo):
+            combo.configure(values=())
+            combo.set("")
+        self._refresh_compare_keys()
+
+    def _refresh_compare_keys(self, _event: object = None) -> None:
+        self.compare_key_list.configure(state="normal")
+        self.compare_key_list.delete(0, "end")
+        left, right = self.compare_reference_table_combo.current(), self.compare_comparison_table_combo.current()
+        if left >= 0 and right >= 0:
+            for column in self.compare_tables[0][left].columns:
+                self.compare_key_list.insert("end", column)
+        self._render_compare_state()
+
+    def _load_compare_tables(self) -> None:
+        reference, comparison = Path(self.compare_reference_var.get()), Path(self.compare_comparison_var.get())
+        self._invalidate_compare_tables()
+        self._start_worker(lambda: ("compare_tables", self.compare_service.inspect_tables(reference, comparison)))
+
+    def _browse_compare_input(self, kind: str) -> None:
+        label = "기준" if kind == "reference" else "비교대상"
+        selected = filedialog.askopenfilename(parent=self.root, title=f"{label} Excel 파일 선택",
+                                              filetypes=(("Excel 통합문서", "*.xlsx"),))
+        if not selected:
+            return
+        path = Path(selected).resolve()
+        variable = self.compare_reference_var if kind == "reference" else self.compare_comparison_var
+        variable.set(str(path))
+        self._invalidate_compare_tables()
+        if kind == "comparison":
+            filename = _unique_filename(f"{path.stem}_비교결과", {p.name.casefold() for p in path.parent.iterdir()})
+            self.compare_output_var.set(str(path.parent / filename))
+        self.compare_status_var.set("파일과 결과 저장 위치를 확인하고 비교 및 저장을 누르세요.")
+        self._render_compare_state()
+
+    def _browse_compare_output(self) -> None:
+        current = Path(self.compare_output_var.get() or "비교결과.xlsx")
+        selected = filedialog.asksaveasfilename(
+            parent=self.root, title="비교 결과를 저장할 새 파일", initialdir=str(current.parent),
+            initialfile=current.name, defaultextension=".xlsx",
+            filetypes=(("Excel 통합문서", "*.xlsx"),), confirmoverwrite=False,
+        )
+        if selected:
+            self.compare_output_var.set(selected)
+            self._render_compare_state()
+
+    def _compare(self) -> None:
+        reference = Path(self.compare_reference_var.get())
+        comparison = Path(self.compare_comparison_var.get())
+        target = Path(self.compare_output_var.get())
+        options = {}
+        if self.compare_by_key_var.get():
+            keys = tuple(self.compare_key_list.get(index) for index in self.compare_key_list.curselection())
+            if not keys:
+                messagebox.showerror("키 컬럼 선택", "비교할 키 컬럼을 하나 이상 선택하세요.", parent=self.root)
+                return
+            reference_table = self.compare_tables[0][self.compare_reference_table_combo.current()]
+            comparison_table = self.compare_tables[1][self.compare_comparison_table_combo.current()]
+            options = dict(key_columns=keys,
+                           reference_table=(reference_table.sheet_name, reference_table.table_name),
+                           comparison_table=(comparison_table.sheet_name, comparison_table.table_name))
+        self._start_worker(lambda: ("compare_execute", self.compare_service.execute(
+            reference, comparison, target, **options,
+            progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
+        )))
 
     def _render_merge_state(self) -> None:
         ready = len(self.merge_sources) >= 2 and bool(self.merge_output_var.get())
@@ -161,11 +315,21 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         if busy:
             self._reset_progress()
             self.merge_status_var.set("처리 중입니다...")
+            self.compare_status_var.set("처리 중입니다...")
         self._render_merge_state()
+        self._render_compare_state()
 
     def _handle_ok(self, payload: object) -> None:
         tag, value = payload
-        if tag == "merge_preview":
+        if tag == "compare_tables":
+            self.compare_tables = value
+            for combo, tables in zip((self.compare_reference_table_combo, self.compare_comparison_table_combo), value):
+                combo.configure(values=tuple(f"{table.sheet_name} / {table.table_name}" for table in tables))
+                combo.current(0)
+            self._refresh_compare_keys()
+            self._set_busy(False)
+            self.compare_status_var.set("양쪽 표를 확인하고 키 컬럼을 클릭하여 선택하세요. 수식은 계산값으로 비교합니다.")
+        elif tag == "merge_preview":
             self.merge_preview = value
             for index, item in enumerate(value.inputs):
                 self.merge_tree.item(str(index), values=(str(item.source), item.sheet_name, item.row_count))
@@ -176,22 +340,39 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             self._set_busy(False)
             self.merge_status_var.set(f"병합 완료: {value}")
             messagebox.showinfo("병합 결과", f"병합 파일을 저장했습니다.\n{value}", parent=self.root)
+        elif tag == "compare_execute":
+            self._set_busy(False)
+            summary = f"비교 완료: 다른 셀 {value.changed_cells}개를 노란색으로 표시했습니다.\n{value.target}"
+            if value.missing_sheets:
+                summary += "\n\n비교대상에 없어 표시하지 못한 기준 시트: " + ", ".join(value.missing_sheets)
+            if value.missing_rows:
+                summary += f"\n비교대상에 없는 기준 키: {value.missing_rows}개"
+            if value.missing_columns:
+                summary += "\n비교대상에 없는 기준 컬럼: " + ", ".join(value.missing_columns)
+            self.compare_status_var.set(summary)
+            messagebox.showinfo("비교 결과", summary, parent=self.root)
         else:
             super()._handle_ok(payload)
 
     def _handle_error(self, error: object) -> None:
-        merging = self.notebook.index(self.notebook.select()) == 1
+        selected = self.notebook.index(self.notebook.select())
+        merging = selected == 1
         if merging:
             self._invalidate_merge_preview()
         super()._handle_error(error)
         if merging:
             self.merge_status_var.set("오류가 발생했습니다. 파일과 설정을 확인한 뒤 미리보기를 다시 실행하세요.")
+        elif selected == 2:
+            self.compare_status_var.set("오류가 발생했습니다. 파일·표·키 컬럼과 새 결과 파일의 경로를 확인하세요.")
 
     def _reset_progress(self) -> None:
         super()._reset_progress()
         self.merge_progress.configure(maximum=1)
+        self.compare_progress.configure(maximum=1)
 
     def _show_progress(self, completed: int, total: int, label: str) -> None:
         super()._show_progress(completed, total, label)
         self.merge_progress.configure(maximum=max(total, 1))
         self.merge_status_var.set(f"처리 중: {label} ({completed}/{total})")
+        self.compare_progress.configure(maximum=max(total, 1))
+        self.compare_status_var.set(f"처리 중: {label} ({completed}/{total})")
