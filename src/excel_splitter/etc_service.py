@@ -10,7 +10,7 @@ from pathlib import Path
 from .compare_service import _save_comparison as _save_xlsx, _validate_paths
 from .errors import SplitExecutionError, WorkbookValidationError
 from .excel_artifacts import delete_removable_artifacts
-from .excel_gateway import _close_without_saving, _excel_session, _open_workbook, _publish_temp, _worksheet
+from .excel_gateway import _close_without_saving, _com_stage, _excel_session, _open_workbook, _publish_temp, _worksheet
 from .file_signature import capture_signature, same_signature
 from .ports import ProgressCallback
 from .source_session import _verify_xlsx_package
@@ -68,8 +68,9 @@ class EtcService:
     def execute(
         self, source: Path, sheet_name: str, target: Path, *,
         remove_artifacts: bool, reset_fill: bool, progress: ProgressCallback, exclude_table_headers: bool = True,
+        remove_conditional_formats: bool = False,
     ) -> Path:
-        if not remove_artifacts and not reset_fill:
+        if not remove_artifacts and not reset_fill and not remove_conditional_formats:
             raise WorkbookValidationError("실행할 정리 작업을 하나 이상 선택하세요.")
         source, target = Path(source).resolve(), Path(target).absolute()
         _validate_paths(source, source, target)
@@ -96,6 +97,9 @@ class EtcService:
                             _reset_fills_except_table_headers(sheet)
                         else:
                             sheet.Cells.Interior.Pattern = -4142  # xlPatternNone; retain Table styles and conditional formats.
+                    if remove_conditional_formats:
+                        with _com_stage(f"조건부 서식 삭제: {sheet_name}"):
+                            sheet.Cells.FormatConditions.Delete()
                     progress(1, 1, sheet_name)
                     _save_xlsx(workbook, temp)
                 finally:

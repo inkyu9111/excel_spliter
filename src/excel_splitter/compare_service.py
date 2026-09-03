@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import shutil
 import stat
 import sys
@@ -10,13 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from .errors import SplitExecutionError, WorkbookValidationError
-from .excel_gateway import _close_without_saving, _excel_error_code, _excel_session, _open_workbook, _publish_temp
+from .excel_gateway import _close_without_saving, _com_stage, _excel_error_code, _excel_session, _open_workbook, _publish_temp
 from .file_signature import capture_signature, same_signature
 from .merge_service import _same_file
 from .naming import _INVALID_CHARACTERS
 from .ports import ProgressCallback
 from .source_session import _verify_xlsx_package
 from .split_service import _validate_output_dir, _validate_source_path
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,10 @@ class CompareService:
         # Reject an existing symlink itself before resolving its destination.
         _validate_paths(reference, comparison, target)
         target = target.resolve()
+        logger.info(
+            "Compare start: mode=%s reference=%s comparison=%s target=%s",
+            "key" if key_columns else "position", reference, comparison, target,
+        )
         signatures = tuple(capture_signature(source) for source in (reference, comparison))
         descriptor, filename = tempfile.mkstemp(prefix=".ec-", suffix=".xlsx", dir=target.parent)
         os.close(descriptor)
@@ -121,14 +129,15 @@ class CompareService:
                 raise SplitExecutionError(f"비교 임시 파일을 삭제하지 못했습니다: {temp}; {active_error or exc}") from exc
 
 
-def _range_rows(sheet: Any, used: Any):
+def _range_rows(sheet: Any, used: Any, *, sheet_name: str = "(이름 없음)"):
     first_row, first_column = int(used.Row), int(used.Column)
     row_count, column_count = int(used.Rows.Count), int(used.Columns.Count)
     last_column = first_column + column_count - 1
     rows_per_chunk = max(1, 32768 // column_count)
     for row in range(first_row, first_row + row_count, rows_per_chunk):
         last_row = min(row + rows_per_chunk, first_row + row_count) - 1
-        block = sheet.Range(sheet.Cells(row, first_column), sheet.Cells(last_row, last_column)).Value2
+        with _com_stage(f"값 읽기: {sheet_name} R{row}C{first_column}:R{last_row}C{last_column}"):
+            block = sheet.Range(sheet.Cells(row, first_column), sheet.Cells(last_row, last_column)).Value2
         if last_row == row and column_count == 1:
             block = ((block,),)
         for row_offset, cells in enumerate(block):
@@ -138,10 +147,16 @@ def _range_rows(sheet: Any, used: Any):
 def _read_values(sheet: Any) -> dict[tuple[int, int], Any]:
     used = sheet.UsedRange
     first_column = int(used.Column)
+    first_row, row_count, column_count = int(used.Row), int(used.Rows.Count), int(used.Columns.Count)
+    sheet_name = str(getattr(sheet, "Name", "(이름 없음)"))
+    logger.info(
+        "Compare read: sheet=%s used_range=R%sC%s rows=%s columns=%s",
+        sheet_name, first_row, first_column, row_count, column_count,
+    )
     # ponytail: keep snapshots in memory; spill them if workbook size requires it.
     return {
         (row, first_column + offset): value
-        for row, cells in _range_rows(sheet, used)
+        for row, cells in _range_rows(sheet, used, sheet_name=sheet_name)
         for offset, value in enumerate(cells)
         if value is not None and value != ""
     }
@@ -189,7 +204,7 @@ def _keyed_rows(sheet: Any, table: Any, keys: tuple[str, ...], source: Path):
     indexes = tuple(columns.index(key) for key in keys)
     rows = {}
     if int(table.ListRows.Count):
-        for row, cells in _range_rows(sheet, table.DataBodyRange):
+        for row, cells in _range_rows(sheet, table.DataBodyRange, sheet_name=str(getattr(sheet, "Name", "(이름 없음)"))):
             key = tuple(_typed_value(cells[index]) for index in indexes)
             if key in rows:
                 raise WorkbookValidationError(f"Key가 중복되었습니다: {source.name} / {sheet.Name} / {table.Name}, 행 {rows[key][0]}, {row}")
@@ -203,49 +218,64 @@ def _highlight(sheet: Any, coordinates: list[tuple[int, int]]) -> None:
     if sheet.ProtectContents:
         raise WorkbookValidationError(f"보호된 시트에 비교 표시를 할 수 없습니다: {sheet.Name}")
     start_row, start_column = coordinates[0]
+    sheet_name = str(getattr(sheet, "Name", "(이름 없음)"))
     end_column = start_column
     for row, column in coordinates[1:] + [(0, 0)]:
         if row == start_row and column == end_column + 1:
             end_column = column
             continue
-        cells = sheet.Range(sheet.Cells(start_row, start_column), sheet.Cells(start_row, end_column))
-        cells.Interior.Pattern = 1  # xlSolid
-        cells.Interior.Color = 65535  # RGB(255, 255, 0)
-        if int(cells.FormatConditions.Count):
-            rule = cells.FormatConditions.Add(Type=2, Formula1="=TRUE")
-            rule.Interior.Color = 65535
-            rule.SetFirstPriority()
-            rule.StopIfTrue = False  # Keep lower-priority fonts and borders.
+        range_name = f"R{start_row}C{start_column}:R{start_row}C{end_column}"
+        with _com_stage(f"강조 직접 채우기: {sheet_name} {range_name}"):
+            cells = sheet.Range(sheet.Cells(start_row, start_column), sheet.Cells(start_row, end_column))
+            cells.Interior.Pattern = 1  # xlSolid
+            cells.Interior.Color = 65535  # RGB(255, 255, 0)
+        with _com_stage(f"강조 조건부 서식 확인: {sheet_name} {range_name}"):
+            has_conditions = int(cells.FormatConditions.Count)
+        if has_conditions:
+            with _com_stage(f"강조 조건부 서식 추가: {sheet_name} {range_name}"):
+                # Pass all positional slots to avoid late-bound optional-argument errors.
+                rule = cells.FormatConditions.Add(2, 3, "=TRUE", "")
+                rule.Interior.Color = 65535
+            with _com_stage(f"강조 조건부 서식 우선순위: {sheet_name} {range_name}"):
+                rule.SetFirstPriority()
+                rule.StopIfTrue = False  # Keep lower-priority fonts and borders.
         start_row, start_column, end_column = row, column, column
 
 
 def _write_comparison(reference: Path, temp: Path, progress: ProgressCallback) -> tuple[int, tuple[str, ...]]:
     with _excel_session() as excel:
-        baseline = _open_workbook(excel, reference, read_only=True)
+        with _com_stage(f"기준 파일 열기: {reference.name}"):
+            baseline = _open_workbook(excel, reference, read_only=True)
         try:
-            excel.Calculate()
-            values = {
-                str(sheet.Name): _read_values(sheet)
-                for sheet in (baseline.Worksheets.Item(index) for index in range(1, baseline.Worksheets.Count + 1))
-            }
+            with _com_stage(f"기준 파일 계산: {reference.name}"):
+                excel.Calculate()
+            with _com_stage(f"기준 시트 검색: {reference.name}"):
+                sheets = tuple(baseline.Worksheets.Item(index) for index in range(1, baseline.Worksheets.Count + 1))
+            values = {str(sheet.Name): _read_values(sheet) for sheet in sheets}
         finally:
             _close_without_saving(baseline)
-        workbook = _open_workbook(excel, temp, read_only=False)
+        with _com_stage(f"비교 파일 열기: {temp.name}"):
+            workbook = _open_workbook(excel, temp, read_only=False)
         try:
-            excel.Calculate()
+            with _com_stage(f"비교 파일 계산: {temp.name}"):
+                excel.Calculate()
             changed = 0
-            total = int(workbook.Worksheets.Count)
+            with _com_stage(f"비교 시트 검색: {temp.name}"):
+                total = int(workbook.Worksheets.Count)
             for index in range(1, total + 1):
-                sheet = workbook.Worksheets.Item(index)
-                previous = values.pop(str(sheet.Name), {})
+                with _com_stage(f"비교 시트 검색: {temp.name} #{index}"):
+                    sheet = workbook.Worksheets.Item(index)
+                    sheet_name = str(sheet.Name)
+                previous = values.pop(sheet_name, {})
                 current = _read_values(sheet)
                 differences = sorted(
                     coordinate for coordinate in previous.keys() | current.keys()
                     if _typed_value(previous.get(coordinate)) != _typed_value(current.get(coordinate))
                 )
+                logger.info("Compare sheet: sheet=%s differences=%s", sheet_name, len(differences))
                 _highlight(sheet, differences)
                 changed += len(differences)
-                progress(index, total, str(sheet.Name))
+                progress(index, total, sheet_name)
             _save_comparison(workbook, temp)
         finally:
             _close_without_saving(workbook)
@@ -253,10 +283,11 @@ def _write_comparison(reference: Path, temp: Path, progress: ProgressCallback) -
 
 
 def _save_comparison(workbook: Any, temp: Path) -> None:
-    workbook.SaveAs(
-        str(temp), FileFormat=51, Password="", WriteResPassword="",
-        ReadOnlyRecommended=False, AddToMru=False,
-    )
+    with _com_stage(f"결과 저장: {temp.name}"):
+        workbook.SaveAs(
+            str(temp), FileFormat=51, Password="", WriteResPassword="",
+            ReadOnlyRecommended=False, AddToMru=False,
+        )
     if Path(str(workbook.FullName)).resolve() != temp:
         raise SplitExecutionError("결과가 지정한 임시 경로에 저장되지 않았습니다.")
 
@@ -266,17 +297,23 @@ def _write_key_comparison(
     reference_table: tuple[str, str] | None, comparison_table: tuple[str, str] | None,
 ) -> tuple[int, int, tuple[str, ...]]:
     with _excel_session() as excel:
-        baseline = _open_workbook(excel, reference, read_only=True)
+        with _com_stage(f"기준 파일 열기: {reference.name}"):
+            baseline = _open_workbook(excel, reference, read_only=True)
         try:
-            excel.Calculate()
-            sheet, table = _select_table(baseline, reference_table, reference)
+            with _com_stage(f"기준 파일 계산: {reference.name}"):
+                excel.Calculate()
+            with _com_stage(f"기준 Table 검색: {reference.name}"):
+                sheet, table = _select_table(baseline, reference_table, reference)
             previous_columns, previous = _keyed_rows(sheet, table, keys, reference)
         finally:
             _close_without_saving(baseline)
-        workbook = _open_workbook(excel, temp, read_only=False)
+        with _com_stage(f"비교 파일 열기: {temp.name}"):
+            workbook = _open_workbook(excel, temp, read_only=False)
         try:
-            excel.Calculate()
-            sheet, table = _select_table(workbook, comparison_table, comparison)
+            with _com_stage(f"비교 파일 계산: {temp.name}"):
+                excel.Calculate()
+            with _com_stage(f"비교 Table 검색: {comparison.name}"):
+                sheet, table = _select_table(workbook, comparison_table, comparison)
             columns, current = _keyed_rows(sheet, table, keys, comparison)
             first_column = int(table.DataBodyRange.Column) if current else 0
             previous_indexes = {name: index for index, name in enumerate(previous_columns)}
@@ -288,6 +325,7 @@ def _write_key_comparison(
                     if prior is None or _typed_value(prior_value) != _typed_value(cells[index]):
                         differences.append((row, first_column + index))
             # Both Tables have passed key validation before any cell is formatted.
+            logger.info("Compare key sheet: sheet=%s differences=%s", sheet.Name, len(differences))
             _highlight(sheet, differences)
             progress(1, 1, f"{sheet.Name} / {table.Name}")
             _save_comparison(workbook, temp)

@@ -54,7 +54,7 @@ def main() -> None:
                     sheet.Range("D4").Font.Bold = True
                     sheet.Range("D4").Borders.Item(9).LineStyle = 1  # bottom edge
                     sheet.Range("G2").Value2 = "conditional fill"
-                    condition = sheet.Range("G2").FormatConditions.Add(Type=2, Formula1="=TRUE")
+                    condition = sheet.Range("G2").FormatConditions.Add(2, 3, "=TRUE", "")
                     condition.Interior.Color = 255
                     sheet.Range("D5").AddComment("legacy note")
                     try:
@@ -81,13 +81,16 @@ def main() -> None:
         service = EtcService()
         assert service.inspect_source(source) == ("Selected", "Other")
         outputs = []
-        for remove_artifacts, reset_fill, exclude_headers in (
-            (True, False, True), (False, True, True), (True, True, True), (False, True, False),
+        for remove_artifacts, reset_fill, exclude_headers, remove_conditional_formats in (
+            (True, False, True, False), (False, True, True, False),
+            (True, True, True, False), (False, True, False, False),
+            (False, False, True, True), (True, True, True, True),
         ):
-            output = root / f"result-{int(remove_artifacts)}-{int(reset_fill)}-{int(exclude_headers)}.xlsx"
+            output = root / f"result-{int(remove_artifacts)}-{int(reset_fill)}-{int(exclude_headers)}-{int(remove_conditional_formats)}.xlsx"
             options = {} if exclude_headers else {"exclude_table_headers": False}
             service.execute(source, "Selected", output, remove_artifacts=remove_artifacts,
-                            reset_fill=reset_fill, progress=lambda *_: None, **options)
+                            reset_fill=reset_fill, remove_conditional_formats=remove_conditional_formats,
+                            progress=lambda *_: None, **options)
             outputs.append(output)
             assert capture_signature(source) == signature
             with _excel_session() as excel:
@@ -117,8 +120,12 @@ def main() -> None:
                         assert sheet.Range(address).Interior.Pattern == (-4142 if reset_fill else 1), address
                     assert sheet.Range("Z100000").Interior.Pattern == (-4142 if reset_fill else 1)
                     assert sheet.Range("Z100000").Value2 is None
-                    assert sheet.Range("G2").FormatConditions.Count == 1
-                    assert sheet.Range("G2").DisplayFormat.Interior.Color == 255
+                    assert sheet.Range("G2").FormatConditions.Count == (0 if remove_conditional_formats else 1)
+                    if remove_conditional_formats:
+                        assert sheet.Cells.FormatConditions.Count == 0
+                        assert sheet.Range("G2").Interior.Pattern == (-4142 if reset_fill else 1)
+                    else:
+                        assert sheet.Range("G2").DisplayFormat.Interior.Color == 255
                     assert sheet.Range("C4").Formula == "=10*2" and sheet.Range("C4").Value2 == 20
                     assert sheet.Range("C4").NumberFormat == "0.00"
                     assert sheet.Range("D4").Font.Bold and sheet.Range("D4").Borders.Item(9).LineStyle == 1
@@ -141,7 +148,7 @@ def main() -> None:
             raise AssertionError("Existing output was accepted")
         assert capture_signature(outputs[-1]) == prior and capture_signature(source) == signature
         assert set(root.iterdir()) == {source, *outputs}
-    print("PASS: native Etc options, shapes/notes/supported threaded comments, direct fill reset, optional multi-table header preservation, Table bands/totals, conditional fill, distant blank cells, formulas/styles, other sheet, original hashes, and output rejection")
+    print("PASS: native Etc options, shapes/notes/supported threaded comments, direct fill reset, optional multi-table header preservation, Table bands/totals, optional conditional format deletion, distant blank cells, formulas/styles, other sheet, original hashes, and output rejection")
 
 
 if __name__ == "__main__":

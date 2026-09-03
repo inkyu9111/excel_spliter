@@ -158,3 +158,25 @@ def test_preview_keeps_existing_file_for_backend_output_validation(
     assert len(workers) == 1
     with pytest.raises(WorkbookValidationError, match="출력 폴더가 존재하지 않습니다."):
         workers[0]()
+
+
+def test_error_dialog_includes_the_configured_log_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    gui = ExcelSplitterGui.__new__(ExcelSplitterGui)
+    log_path = Path("logs/excel-file-toolkit.log")
+    gui.logger = SimpleNamespace(error=lambda *_args, **_kwargs: None, handlers=[SimpleNamespace(baseFilename=str(log_path))])
+    gui.root = object()
+    gui.controller = SimpleNamespace(state=object())
+    gui.status_var = SimpleNamespace(set=lambda *_args: None)
+    gui._set_busy = lambda *_args: None
+    gui._reset_progress = lambda: None
+    gui._render_state = lambda *_args: None
+    messages = []
+    monkeypatch.setattr(
+        "excel_splitter.gui.messagebox.showerror",
+        lambda _title, message, **_kwargs: messages.append(message),
+    )
+
+    gui._handle_error(WorkbookValidationError("비교 실패"))
+
+    assert len(messages) == 1
+    assert str(log_path) in messages[0]

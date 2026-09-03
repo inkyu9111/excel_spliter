@@ -110,7 +110,7 @@ def main() -> None:
                         sheet.Range("A33000").Value2 = "removed after chunk boundary"
                     sheet.Range("A1").Interior.Color = 255
                     sheet.Range("B1").Interior.Color = 65280
-                    rule = sheet.Range("B1").FormatConditions.Add(Type=2, Formula1="=TRUE")
+                    rule = sheet.Range("B1").FormatConditions.Add(2, 3, "=TRUE", "")
                     rule.Interior.Color = 255
                     rule.Font.Bold = True
                     sheet.Range("A1").Font.Bold = True

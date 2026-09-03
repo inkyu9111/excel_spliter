@@ -41,6 +41,14 @@ def configure_logging() -> logging.Logger:
     return logger
 
 
+def _log_path(logger: logging.Logger) -> Path:
+    for handler in getattr(logger, "handlers", ()):
+        if path := getattr(handler, "baseFilename", None):
+            return Path(path)
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+    return local_app_data / "ExcelFileToolkit" / "logs" / "excel-file-toolkit.log"
+
+
 class ExcelSplitterGui:
     def __init__(self, root: tk.Tk, controller: AppController) -> None:
         self.root = root
@@ -292,6 +300,7 @@ class ExcelSplitterGui:
             )
         else:
             message = str(exc) if isinstance(exc, ExcelSplitterError) else UNEXPECTED_ERROR_MESSAGE
+        message += f"\n\n자세한 내용: {_log_path(self.logger)}"
         self._reset_progress()
         messagebox.showerror("오류", message, parent=self.root)
         self._render_state(self.controller.state)

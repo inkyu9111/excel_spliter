@@ -1,9 +1,10 @@
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from excel_splitter.errors import WorkbookValidationError
+from excel_splitter.errors import SplitExecutionError, WorkbookValidationError
 
 
 def _setup(tmp_path, monkeypatch):
@@ -201,7 +202,15 @@ def test_highlight_uses_row_runs_and_overrides_existing_conditional_fill():
 
     ranges = []
     rule = SimpleNamespace(Interior=SimpleNamespace(), SetFirstPriority=lambda: None)
-    conditions = SimpleNamespace(Count=1, Add=lambda **_: rule)
+    calls = []
+
+    def add(*args):
+        calls.append(args)
+        if len(args) != 4:
+            raise RuntimeError("required argument omitted")
+        return rule
+
+    conditions = SimpleNamespace(Count=1, Add=add)
 
     def bounded(first, last):
         result = SimpleNamespace(Interior=SimpleNamespace(), FormatConditions=conditions)
@@ -212,8 +221,60 @@ def test_highlight_uses_row_runs_and_overrides_existing_conditional_fill():
     compare._highlight(sheet, [(1, 1), (1, 2), (1, 4), (2, 1)])
     assert [(first, last) for first, last, _ in ranges] == [((1, 1), (1, 2)), ((1, 4), (1, 4)), ((2, 1), (2, 1))]
     assert all(result.Interior.Color == 65535 and result.Interior.Pattern == 1 for _, _, result in ranges)
+    assert calls == [(2, 3, "=TRUE", "")] * 3
     assert rule.Interior.Color == 65535
     assert rule.StopIfTrue is False
+
+
+def test_highlight_names_conditional_format_stage_and_range_when_add_fails():
+    from excel_splitter import compare_service as compare
+
+    error = RuntimeError(-2147352567, "exception", (0, None, None, None, 0, -2147352561), None)
+    conditions = SimpleNamespace(Count=1, Add=lambda *_args: (_ for _ in ()).throw(error))
+    sheet = SimpleNamespace(
+        Name="Data", ProtectContents=False, Cells=lambda row, column: (row, column),
+        Range=lambda *_args: SimpleNamespace(Interior=SimpleNamespace(), FormatConditions=conditions),
+    )
+
+    with pytest.raises(SplitExecutionError) as captured:
+        compare._highlight(sheet, [(7, 4)])
+
+    assert "조건부 서식" in str(captured.value)
+    assert "Data" in str(captured.value) and "R7C4" in str(captured.value)
+    assert captured.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    ("operation", "invoke", "expected_stage"),
+    (
+        (
+            "read",
+            lambda compare, error: compare._read_values(SimpleNamespace(
+                Name="Data",
+                UsedRange=SimpleNamespace(Row=5, Column=3, Rows=SimpleNamespace(Count=1), Columns=SimpleNamespace(Count=1)),
+                Cells=lambda row, column: (row, column),
+                Range=lambda *_args: SimpleNamespace(Value2=(_ for _ in ()).throw(error)),
+            )),
+            "값 읽기: Data R5C3:R5C3",
+        ),
+        (
+            "save",
+            lambda compare, error: compare._save_comparison(
+                SimpleNamespace(SaveAs=lambda *_args, **_kwargs: (_ for _ in ()).throw(error)), Path("result.xlsx")
+            ),
+            "결과 저장: result.xlsx",
+        ),
+    ),
+)
+def test_compare_com_failures_name_the_operation_and_preserve_the_cause(operation, invoke, expected_stage):
+    from excel_splitter import compare_service as compare
+
+    error = RuntimeError(f"{operation} failed")
+    with pytest.raises(SplitExecutionError) as captured:
+        invoke(compare, error)
+
+    assert expected_stage in str(captured.value)
+    assert captured.value.__cause__ is error
 
 
 def test_protected_changed_sheet_fails_before_any_highlight():

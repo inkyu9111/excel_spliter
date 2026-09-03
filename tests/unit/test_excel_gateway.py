@@ -30,6 +30,7 @@ from excel_splitter.models import (
 from excel_splitter.excel_gateway import (
     ExcelComGateway,
     _column_index,
+    _com_stage,
     _contiguous_descending_blocks,
     _copy_to_master,
     _delete_row_blocks,
@@ -384,6 +385,20 @@ def test_excel_session_does_not_swallow_attribute_error_from_with_body(
             raise AttributeError("missing COM member")
 
     assert events == ["initialize", "quit", "uninitialize"]
+
+
+def test_com_stage_includes_hresult_and_excepinfo_without_losing_cause() -> None:
+    error = FakeComError(-2147352567, "예외가 발생했습니다.", -2147352561)
+
+    with pytest.raises(SplitExecutionError) as captured:
+        with _com_stage("조건부 서식 추가: Data R7C4"):
+            raise error
+
+    message = str(captured.value)
+    assert "조건부 서식 추가: Data R7C4" in message
+    assert "0x80020009" in message and "0x8002000F" in message
+    assert "필수 매개 변수" in message
+    assert captured.value.__cause__ is error
 
 
 def test_output_excel_session_does_not_access_calculation_before_workbook_open(

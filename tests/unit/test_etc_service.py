@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from excel_splitter.errors import WorkbookValidationError
+from excel_splitter.errors import SplitExecutionError, WorkbookValidationError
 
 
 class _Collection:
@@ -27,6 +27,14 @@ def _artifacts():
     return collection
 
 
+class _FormatConditions:
+    def __init__(self, count=1):
+        self.Count = count
+
+    def Delete(self):
+        self.Count = 0
+
+
 def _setup(tmp_path, monkeypatch):
     from excel_splitter import etc_service as etc
 
@@ -40,7 +48,7 @@ def _setup(tmp_path, monkeypatch):
             ListObjects=SimpleNamespace(TableStyle="TableStyleMedium2", Count=0),
             Cells=SimpleNamespace(Interior=SimpleNamespace(Pattern=1), Value2=((1, "keep"),), Formula=(("=1", "keep"),),
                 Font=SimpleNamespace(Bold=True), Borders=SimpleNamespace(LineStyle=1), NumberFormat="0.00",
-                FormatConditions=SimpleNamespace(Count=1), ClearFormats=lambda: pytest.fail("Broad ClearFormats is forbidden")))
+                FormatConditions=_FormatConditions(), ClearFormats=lambda: pytest.fail("Broad ClearFormats is forbidden")))
 
     selected, other = sheet("Selected"), sheet("Other")
     book = SimpleNamespace(Worksheets=_Collection(selected, other), FullName="")
@@ -94,6 +102,45 @@ def test_cleanup_options_affect_only_selected_sheet_and_keep_other_cell_styles(t
     assert progress[-1] == (1, 1, "Selected")
 
 
+def test_conditional_format_removal_is_independent_and_scoped_to_selected_sheet(tmp_path, monkeypatch):
+    etc, source, target, selected, other, _book, _events = _setup(tmp_path, monkeypatch)
+
+    etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=False,
+                             remove_conditional_formats=True, progress=lambda *_: None)
+
+    assert selected.Cells.FormatConditions.Count == 0
+    assert other.Cells.FormatConditions.Count == 1
+    assert selected.Cells.Interior.Pattern == other.Cells.Interior.Pattern == 1
+    assert selected.Shapes.Count == other.Shapes.Count == 2
+
+
+def test_conditional_format_removal_also_clears_table_headers_when_fill_excludes_them(tmp_path, monkeypatch):
+    etc, source, target, selected, _other, _book, _events = _setup(tmp_path, monkeypatch)
+    fills = _track_fill_cells(selected, 4, 5)
+    selected.Cells.FormatConditions = _FormatConditions()
+    selected.ListObjects = _Collection(_table(2, 2, 3))
+
+    etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=True,
+                             remove_conditional_formats=True, exclude_table_headers=True, progress=lambda *_: None)
+
+    assert {cell for cell, pattern in fills.items() if pattern == 1} == {(2, 2), (2, 3), (2, 4)}
+    assert selected.Cells.FormatConditions.Count == 0
+
+
+def test_conditional_format_deletion_failure_keeps_original_and_never_publishes(tmp_path, monkeypatch):
+    etc, source, target, selected, _other, _book, events = _setup(tmp_path, monkeypatch)
+    selected.Cells.FormatConditions.Delete = lambda: (_ for _ in ()).throw(RuntimeError("delete failed"))
+
+    with pytest.raises(SplitExecutionError):
+        etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=False,
+                                 remove_conditional_formats=True, progress=lambda *_: None)
+
+    assert source.read_bytes() == b"source"
+    assert not target.exists()
+    assert {path.name for path in tmp_path.iterdir()} == {"source.xlsx"}
+    assert events == [("open", False), ("close", {"SaveChanges": False})]
+
+
 @pytest.mark.parametrize("invalid", ["noop", "sheet", "protected_cells", "protected_objects", "source_target", "existing", "hardlink", "symlink", "dangling_symlink"])
 def test_rejection_preserves_original_and_existing_output(tmp_path, monkeypatch, invalid):
     etc, source, target, selected, _other, _book, _events = _setup(tmp_path, monkeypatch)
@@ -142,8 +189,12 @@ def test_failure_never_publishes_partial_output_and_closes_copy(tmp_path, monkey
         elif failure == "target_created":
             target.write_bytes(b"new owner")
 
-    with pytest.raises((RuntimeError, WorkbookValidationError, OSError)):
+    expected = SplitExecutionError if failure == "save" else (RuntimeError, WorkbookValidationError, OSError)
+    with pytest.raises(expected) as captured:
         etc.EtcService().execute(source, "Selected", target, remove_artifacts=True, reset_fill=True, progress=progress)
+    if failure == "save":
+        assert "결과 저장" in str(captured.value)
+        assert isinstance(captured.value.__cause__, RuntimeError)
     assert source.read_bytes() == (b"external change" if failure == "source_changed" else b"source")
     assert set(tmp_path.iterdir()) == ({source, target} if failure == "target_created" else {source})
     if failure == "target_created":

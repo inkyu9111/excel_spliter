@@ -61,6 +61,9 @@ _SAVE_LOCK = threading.Lock()
 
 # CVErr values returned by Excel through Value2 (signed HRESULT form).
 _EXCEL_ERROR_CODES = {2000, 2007, 2015, 2023, 2029, 2036, 2042, 2043, 2045}
+_COM_ERROR_DETAILS = {
+    -2147352561: "DISP_E_PARAMNOTOPTIONAL (필수 매개 변수입니다.)",
+}
 
 
 def _capture_signature(path: Path) -> FileSignature:
@@ -79,6 +82,30 @@ def _same_signature(path: Path, expected: FileSignature | None) -> bool:
     from .file_signature import same_signature
 
     return same_signature(path, expected)
+
+
+def _com_error_details(exc: Exception) -> str:
+    hresult = getattr(exc, "hresult", None)
+    if not isinstance(hresult, int) and exc.args and isinstance(exc.args[0], int):
+        hresult = exc.args[0]
+    excepinfo = getattr(exc, "excepinfo", None)
+    if not isinstance(excepinfo, tuple) and len(exc.args) > 2:
+        excepinfo = exc.args[2]
+    source = excepinfo[1] if isinstance(excepinfo, tuple) and len(excepinfo) > 1 else None
+    description = excepinfo[2] if isinstance(excepinfo, tuple) and len(excepinfo) > 2 else None
+    scode = excepinfo[5] if isinstance(excepinfo, tuple) and len(excepinfo) > 5 else None
+    details = []
+    if isinstance(hresult, int):
+        details.append(f"HRESULT=0x{hresult & 0xFFFFFFFF:08X}")
+    if source:
+        details.append(f"source={source}")
+    if description:
+        details.append(f"description={description}")
+    if isinstance(scode, int):
+        details.append(f"scode=0x{scode & 0xFFFFFFFF:08X}")
+        if explanation := _COM_ERROR_DETAILS.get(scode):
+            details.append(explanation)
+    return f" ({'; '.join(details)})" if details else ""
 
 
 @contextmanager
@@ -103,7 +130,7 @@ def _excel_session() -> Iterator[Any]:
     except ExcelSplitterError:
         raise
     except Exception as exc:
-        raise SplitExecutionError(f"Excel 자동화에 실패했습니다: {exc}") from exc
+        raise SplitExecutionError(f"Excel 자동화에 실패했습니다: {exc}{_com_error_details(exc)}") from exc
     finally:
         if excel is not None:
             for name, value in original_settings.items():
@@ -510,7 +537,7 @@ def _com_stage(stage: str) -> Iterator[None]:
         raise
     except Exception as exc:
         raise SplitExecutionError(
-            f"{stage} 중 Excel 자동화에 실패했습니다: {exc}"
+            f"{stage} 중 Excel 자동화에 실패했습니다: {exc}{_com_error_details(exc)}"
         ) from exc
 
 

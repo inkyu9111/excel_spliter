@@ -110,6 +110,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.etc_remove_artifacts_var = tk.BooleanVar(value=False)
         self.etc_reset_fill_var = tk.BooleanVar(value=False)
         self.etc_exclude_table_headers_var = tk.BooleanVar(value=True)
+        self.etc_remove_conditional_formats_var = tk.BooleanVar(value=False)
         ttk.Label(page, text="원본 파일").grid(row=1, column=0, sticky="w")
         ttk.Entry(page, textvariable=self.etc_source_var, state="readonly").grid(row=1, column=1, sticky="ew", padx=8)
         browse = ttk.Button(page, text="찾아보기", command=self._browse_etc_source)
@@ -127,7 +128,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         fill_options = ttk.Frame(page)
         fill_options.grid(row=4, column=0, columnspan=3, sticky="w", pady=6)
         self.etc_reset_fill_checkbox = ttk.Checkbutton(
-            fill_options, text="셀 채우기색 초기화 (표 스타일·조건부 서식 유지)",
+            fill_options, text="셀 채우기색 초기화 (표 스타일 유지)",
             variable=self.etc_reset_fill_var, command=self._render_etc_state,
         )
         self.etc_reset_fill_checkbox.grid(row=0, column=0, sticky="w")
@@ -136,9 +137,14 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             command=self._render_etc_state,
         )
         self.etc_exclude_table_headers_checkbox.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        self.etc_remove_conditional_formats_checkbox = ttk.Checkbutton(
+            fill_options, text="조건부 서식 삭제", variable=self.etc_remove_conditional_formats_var,
+            command=self._render_etc_state,
+        )
+        self.etc_remove_conditional_formats_checkbox.grid(row=1, column=0, sticky="w", pady=(6, 0))
         self._input_widgets.extend((self.etc_remove_artifacts_checkbox, self.etc_reset_fill_checkbox,
-                                    self.etc_exclude_table_headers_checkbox))
-        ttk.Label(page, text="직접 지정한 채우기색만 제거하며 글자색, 테두리, 수식, 값은 유지합니다.",
+                                    self.etc_exclude_table_headers_checkbox, self.etc_remove_conditional_formats_checkbox))
+        ttk.Label(page, text="조건부 서식 삭제는 테이블 헤더를 포함한 선택 시트 전체에 적용됩니다.",
                   wraplength=700).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 14))
         ttk.Label(page, text="결과 파일").grid(row=6, column=0, sticky="w")
         self.etc_output_entry = ttk.Entry(page, textvariable=self.etc_output_var)
@@ -156,7 +162,8 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
 
     def _render_etc_state(self) -> None:
         ready = all((self.etc_source_var.get(), self.etc_sheet_var.get(), self.etc_output_var.get()))
-        ready = ready and (self.etc_remove_artifacts_var.get() or self.etc_reset_fill_var.get())
+        ready = ready and (self.etc_remove_artifacts_var.get() or self.etc_reset_fill_var.get()
+                           or self.etc_remove_conditional_formats_var.get())
         self.etc_exclude_table_headers_checkbox.configure(
             state="normal" if self.etc_reset_fill_var.get() and not self._busy else "disabled",
         )
@@ -193,10 +200,12 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         source, target = Path(self.etc_source_var.get()), Path(self.etc_output_var.get())
         sheet_name = self.etc_sheet_var.get()
         remove_artifacts, reset_fill = self.etc_remove_artifacts_var.get(), self.etc_reset_fill_var.get()
+        remove_conditional_formats = self.etc_remove_conditional_formats_var.get()
         exclude_table_headers = self.etc_exclude_table_headers_var.get()
         self._start_worker(lambda: ("etc_execute", self.etc_service.execute(
             source, sheet_name, target, remove_artifacts=remove_artifacts, reset_fill=reset_fill,
             exclude_table_headers=exclude_table_headers,
+            remove_conditional_formats=remove_conditional_formats,
             progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
         )))
 
