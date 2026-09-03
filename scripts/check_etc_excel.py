@@ -24,6 +24,8 @@ def main() -> None:
         root = Path(directory)
         source = root / "source.xlsx"
         styled_cells = ("B3", "B4", "B5", "B8")  # header, both bands, totals
+        header_cells = ("B3", "C3", "D3", "H3", "I3", "H10", "I10")
+        surrounding_cells = ("A3", "E3", "G3", "J3", "G10", "J10", "H11")
         with _excel_session() as excel:
             book = excel.Workbooks.Add()
             try:
@@ -45,6 +47,9 @@ def main() -> None:
                     table.ShowTableStyleRowStripes = True
                     table.ShowTotals = True
                     table.ListColumns.Item(2).TotalsCalculation = 1
+                    for address in ("H3:I5", "H10:I12"):
+                        sheet.Range(address).Value2 = (("Key", "Value"), ("a", 1), ("b", 2))
+                        sheet.ListObjects.Add(1, sheet.Range(address), None, 1).TableStyle = "TableStyleMedium2"
                     sheet.Range("C4:C7").NumberFormat = "0.00"
                     sheet.Range("D4").Font.Bold = True
                     sheet.Range("D4").Borders.Item(9).LineStyle = 1  # bottom edge
@@ -61,8 +66,12 @@ def main() -> None:
                     sheet.Calculate()
                 table_colors = {address: selected.Range(address).DisplayFormat.Interior.Color for address in styled_cells}
                 for sheet in (selected, other):
-                    for address in (*styled_cells, "G2", "Z100000"):
+                    for address in (*styled_cells, *header_cells, *surrounding_cells, "G2", "Z100000"):
                         sheet.Range(address).Interior.Color = 65535
+                    sheet.Range("C3").Interior.ThemeColor = 5
+                    sheet.Range("C3").Interior.TintAndShade = -0.25
+                header_fills = {address: (selected.Range(address).Interior.Pattern,
+                                          selected.Range(address).Interior.Color) for address in header_cells}
                 before_counts = _counts(selected)
                 other_counts = _counts(other)
                 book.SaveAs(str(source), FileFormat=51)
@@ -72,10 +81,13 @@ def main() -> None:
         service = EtcService()
         assert service.inspect_source(source) == ("Selected", "Other")
         outputs = []
-        for remove_artifacts, reset_fill in ((True, False), (False, True), (True, True)):
-            output = root / f"result-{int(remove_artifacts)}-{int(reset_fill)}.xlsx"
+        for remove_artifacts, reset_fill, exclude_headers in (
+            (True, False, True), (False, True, True), (True, True, True), (False, True, False),
+        ):
+            output = root / f"result-{int(remove_artifacts)}-{int(reset_fill)}-{int(exclude_headers)}.xlsx"
+            options = {} if exclude_headers else {"exclude_table_headers": False}
             service.execute(source, "Selected", output, remove_artifacts=remove_artifacts,
-                            reset_fill=reset_fill, progress=lambda *_: None)
+                            reset_fill=reset_fill, progress=lambda *_: None, **options)
             outputs.append(output)
             assert capture_signature(source) == signature
             with _excel_session() as excel:
@@ -88,10 +100,21 @@ def main() -> None:
                     assert str(getattr(style, "Name", style)) == "TableStyleMedium2"
                     assert table.ShowTableStyleRowStripes and table.ShowTotals
                     for address in styled_cells:
-                        if reset_fill:
+                        if reset_fill and (address != "B3" or not exclude_headers):
                             assert sheet.Range(address).DisplayFormat.Interior.Color == table_colors[address], address
                         else:
                             assert sheet.Range(address).Interior.Color == 65535, address
+                    for address in header_cells:
+                        interior = sheet.Range(address).Interior
+                        if reset_fill and not exclude_headers:
+                            assert interior.Pattern == -4142, address
+                        else:
+                            assert (interior.Pattern, interior.Color) == header_fills[address], address
+                    if exclude_headers or not reset_fill:
+                        assert sheet.Range("C3").Interior.ThemeColor == 5
+                        assert abs(sheet.Range("C3").Interior.TintAndShade + 0.25) < 0.0001
+                    for address in surrounding_cells:
+                        assert sheet.Range(address).Interior.Pattern == (-4142 if reset_fill else 1), address
                     assert sheet.Range("Z100000").Interior.Pattern == (-4142 if reset_fill else 1)
                     assert sheet.Range("Z100000").Value2 is None
                     assert sheet.Range("G2").FormatConditions.Count == 1
@@ -118,7 +141,7 @@ def main() -> None:
             raise AssertionError("Existing output was accepted")
         assert capture_signature(outputs[-1]) == prior and capture_signature(source) == signature
         assert set(root.iterdir()) == {source, *outputs}
-    print("PASS: native Etc options, shapes/notes/supported threaded comments, direct fill reset, Table headers/bands/totals, conditional fill, distant blank cells, formulas/styles, other sheet, original hashes, and output rejection")
+    print("PASS: native Etc options, shapes/notes/supported threaded comments, direct fill reset, optional multi-table header preservation, Table bands/totals, conditional fill, distant blank cells, formulas/styles, other sheet, original hashes, and output rejection")
 
 
 if __name__ == "__main__":

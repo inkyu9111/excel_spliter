@@ -37,7 +37,7 @@ def _setup(tmp_path, monkeypatch):
     def sheet(name):
         return SimpleNamespace(Name=name, ProtectContents=False, ProtectDrawingObjects=False,
             Shapes=_artifacts(), Comments=_artifacts(), CommentsThreaded=_artifacts(),
-            ListObjects=SimpleNamespace(TableStyle="TableStyleMedium2"),
+            ListObjects=SimpleNamespace(TableStyle="TableStyleMedium2", Count=0),
             Cells=SimpleNamespace(Interior=SimpleNamespace(Pattern=1), Value2=((1, "keep"),), Formula=(("=1", "keep"),),
                 Font=SimpleNamespace(Bold=True), Borders=SimpleNamespace(LineStyle=1), NumberFormat="0.00",
                 FormatConditions=SimpleNamespace(Count=1), ClearFormats=lambda: pytest.fail("Broad ClearFormats is forbidden")))
@@ -157,3 +157,83 @@ def test_fill_only_does_not_reject_object_protection(tmp_path, monkeypatch):
     selected.ProtectDrawingObjects = True
     etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=True, progress=lambda *_: None)
     assert target.exists() and selected.Shapes.Count == 2 and selected.Cells.Interior.Pattern == -4142
+
+
+def _track_fill_cells(sheet, rows, columns):
+    fills = {(row, column): 1 for row in range(1, rows + 1) for column in range(1, columns + 1)}
+
+    class Interior:
+        def __init__(self, cells):
+            self.cells = cells
+
+        @property
+        def Pattern(self):
+            return None
+
+        @Pattern.setter
+        def Pattern(self, value):
+            for cell in self.cells:
+                fills[cell] = value
+
+    cells = SimpleNamespace(Interior=Interior(tuple(fills)))
+    cells.Item = lambda row, column: SimpleNamespace(Row=row, Column=column)
+
+    def cell_range(first, last):
+        return SimpleNamespace(Interior=Interior(tuple(
+            (row, column)
+            for row in range(first.Row, last.Row + 1)
+            for column in range(first.Column, last.Column + 1)
+        )))
+
+    sheet.Rows = SimpleNamespace(Count=rows)
+    sheet.Columns = SimpleNamespace(Count=columns)
+    sheet.Cells = cells
+    sheet.Range = cell_range
+    return fills
+
+
+def _table(row, column, width, *, show_headers=True, header_range=True):
+    header = SimpleNamespace(Row=row, Column=column, Rows=SimpleNamespace(Count=1), Columns=SimpleNamespace(Count=width))
+    return SimpleNamespace(ShowHeaders=show_headers, HeaderRowRange=header if header_range else None)
+
+
+def test_reset_fill_preserves_only_visible_table_header_cells_across_multiple_layouts(tmp_path, monkeypatch):
+    etc, source, target, selected, _other, _book, _events = _setup(tmp_path, monkeypatch)
+    fills = _track_fill_cells(selected, 6, 9)
+    selected.ListObjects = _Collection(
+        _table(2, 2, 3), _table(2, 6, 2), _table(4, 1, 2),
+    )
+
+    etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=True,
+                             progress=lambda *_: None)
+
+    headers = {(2, column) for column in range(2, 5)} | {(2, column) for column in range(6, 8)} | {(4, column) for column in range(1, 3)}
+    assert {cell for cell, pattern in fills.items() if pattern == 1} == headers
+    assert {cell for cell, pattern in fills.items() if pattern == -4142} == set(fills) - headers
+
+
+def test_reset_fill_can_clear_visible_table_headers_when_exclusion_is_unchecked(tmp_path, monkeypatch):
+    etc, source, target, selected, _other, _book, _events = _setup(tmp_path, monkeypatch)
+    fills = _track_fill_cells(selected, 4, 5)
+    selected.ListObjects = _Collection(_table(2, 2, 3))
+
+    etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=True,
+                             exclude_table_headers=False, progress=lambda *_: None)
+
+    assert set(fills.values()) == {-4142}
+
+
+@pytest.mark.parametrize("tables", [
+    _Collection(),
+    _Collection(_table(2, 2, 3, show_headers=False)),
+    _Collection(_table(2, 2, 3, header_range=False)),
+])
+def test_reset_fill_clears_entire_sheet_when_a_table_header_is_unavailable(tmp_path, monkeypatch, tables):
+    etc, source, target, selected, _other, _book, _events = _setup(tmp_path, monkeypatch)
+    fills = _track_fill_cells(selected, 4, 5)
+    selected.ListObjects = tables
+
+    etc.EtcService().execute(source, "Selected", target, remove_artifacts=False, reset_fill=True,
+                             exclude_table_headers=True, progress=lambda *_: None)
+
+    assert set(fills.values()) == {-4142}

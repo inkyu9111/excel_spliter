@@ -109,6 +109,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.etc_output_var = tk.StringVar()
         self.etc_remove_artifacts_var = tk.BooleanVar(value=False)
         self.etc_reset_fill_var = tk.BooleanVar(value=False)
+        self.etc_exclude_table_headers_var = tk.BooleanVar(value=True)
         ttk.Label(page, text="원본 파일").grid(row=1, column=0, sticky="w")
         ttk.Entry(page, textvariable=self.etc_source_var, state="readonly").grid(row=1, column=1, sticky="ew", padx=8)
         browse = ttk.Button(page, text="찾아보기", command=self._browse_etc_source)
@@ -118,13 +119,25 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.etc_sheet_combo.grid(row=2, column=1, sticky="ew", padx=8)
         self.etc_sheet_combo.bind("<<ComboboxSelected>>", lambda _: self._render_etc_state())
         self._input_widgets.extend((browse, self.etc_sheet_combo))
-        for row, (label, variable) in enumerate((
-            ("모든 도형·메모·댓글 삭제 (그림, 차트, 버튼 포함)", self.etc_remove_artifacts_var),
-            ("셀 채우기색 초기화 (표 스타일·조건부 서식 유지)", self.etc_reset_fill_var),
-        ), 3):
-            checkbox = ttk.Checkbutton(page, text=label, variable=variable, command=self._render_etc_state)
-            checkbox.grid(row=row, column=0, columnspan=3, sticky="w", pady=6)
-            self._input_widgets.append(checkbox)
+        self.etc_remove_artifacts_checkbox = ttk.Checkbutton(
+            page, text="모든 도형·메모·댓글 삭제 (그림, 차트, 버튼 포함)",
+            variable=self.etc_remove_artifacts_var, command=self._render_etc_state,
+        )
+        self.etc_remove_artifacts_checkbox.grid(row=3, column=0, columnspan=3, sticky="w", pady=6)
+        fill_options = ttk.Frame(page)
+        fill_options.grid(row=4, column=0, columnspan=3, sticky="w", pady=6)
+        self.etc_reset_fill_checkbox = ttk.Checkbutton(
+            fill_options, text="셀 채우기색 초기화 (표 스타일·조건부 서식 유지)",
+            variable=self.etc_reset_fill_var, command=self._render_etc_state,
+        )
+        self.etc_reset_fill_checkbox.grid(row=0, column=0, sticky="w")
+        self.etc_exclude_table_headers_checkbox = ttk.Checkbutton(
+            fill_options, text="테이블 헤더 제외", variable=self.etc_exclude_table_headers_var,
+            command=self._render_etc_state,
+        )
+        self.etc_exclude_table_headers_checkbox.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        self._input_widgets.extend((self.etc_remove_artifacts_checkbox, self.etc_reset_fill_checkbox,
+                                    self.etc_exclude_table_headers_checkbox))
         ttk.Label(page, text="직접 지정한 채우기색만 제거하며 글자색, 테두리, 수식, 값은 유지합니다.",
                   wraplength=700).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 14))
         ttk.Label(page, text="결과 파일").grid(row=6, column=0, sticky="w")
@@ -144,6 +157,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
     def _render_etc_state(self) -> None:
         ready = all((self.etc_source_var.get(), self.etc_sheet_var.get(), self.etc_output_var.get()))
         ready = ready and (self.etc_remove_artifacts_var.get() or self.etc_reset_fill_var.get())
+        self.etc_exclude_table_headers_checkbox.configure(
+            state="normal" if self.etc_reset_fill_var.get() and not self._busy else "disabled",
+        )
         self.etc_sheet_combo.configure(state="readonly" if self.etc_sheet_combo["values"] and not self._busy else "disabled")
         self.etc_button.configure(state="normal" if ready and not self._busy else "disabled")
 
@@ -177,8 +193,10 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         source, target = Path(self.etc_source_var.get()), Path(self.etc_output_var.get())
         sheet_name = self.etc_sheet_var.get()
         remove_artifacts, reset_fill = self.etc_remove_artifacts_var.get(), self.etc_reset_fill_var.get()
+        exclude_table_headers = self.etc_exclude_table_headers_var.get()
         self._start_worker(lambda: ("etc_execute", self.etc_service.execute(
             source, sheet_name, target, remove_artifacts=remove_artifacts, reset_fill=reset_fill,
+            exclude_table_headers=exclude_table_headers,
             progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
         )))
 

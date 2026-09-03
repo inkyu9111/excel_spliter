@@ -17,6 +17,39 @@ from .source_session import _verify_xlsx_package
 from .split_service import _validate_source_path
 
 
+def _subtract_rectangle(rectangle: tuple[int, int, int, int], excluded: tuple[int, int, int, int]) -> list[tuple[int, int, int, int]]:
+    top, left, bottom, right = rectangle
+    excluded_top, excluded_left, excluded_bottom, excluded_right = excluded
+    overlap_top, overlap_left = max(top, excluded_top), max(left, excluded_left)
+    overlap_bottom, overlap_right = min(bottom, excluded_bottom), min(right, excluded_right)
+    if overlap_top > overlap_bottom or overlap_left > overlap_right:
+        return [rectangle]
+    return [candidate for candidate in (
+        (top, left, overlap_top - 1, right), (overlap_bottom + 1, left, bottom, right),
+        (overlap_top, left, overlap_bottom, overlap_left - 1), (overlap_top, overlap_right + 1, overlap_bottom, right),
+    ) if candidate[0] <= candidate[2] and candidate[1] <= candidate[3]]
+
+
+def _reset_fills_except_table_headers(sheet: object) -> None:
+    headers = []
+    for index in range(1, sheet.ListObjects.Count + 1):
+        table = sheet.ListObjects.Item(index)
+        if not table.ShowHeaders:
+            continue
+        header = table.HeaderRowRange
+        if header is not None:
+            headers.append((header.Row, header.Column, header.Row + header.Rows.Count - 1,
+                            header.Column + header.Columns.Count - 1))
+    if not headers:
+        sheet.Cells.Interior.Pattern = -4142  # xlPatternNone; retain Table styles and conditional formats.
+        return
+    rectangles = [(1, 1, sheet.Rows.Count, sheet.Columns.Count)]
+    for header in headers:
+        rectangles = [remaining for rectangle in rectangles for remaining in _subtract_rectangle(rectangle, header)]
+    for top, left, bottom, right in rectangles:
+        sheet.Range(sheet.Cells.Item(top, left), sheet.Cells.Item(bottom, right)).Interior.Pattern = -4142
+
+
 class EtcService:
     def inspect_source(self, source: Path) -> tuple[str, ...]:
         source = Path(source).resolve()
@@ -34,7 +67,7 @@ class EtcService:
 
     def execute(
         self, source: Path, sheet_name: str, target: Path, *,
-        remove_artifacts: bool, reset_fill: bool, progress: ProgressCallback,
+        remove_artifacts: bool, reset_fill: bool, progress: ProgressCallback, exclude_table_headers: bool = True,
     ) -> Path:
         if not remove_artifacts and not reset_fill:
             raise WorkbookValidationError("실행할 정리 작업을 하나 이상 선택하세요.")
@@ -59,7 +92,10 @@ class EtcService:
                     if remove_artifacts:
                         delete_removable_artifacts(sheet)
                     if reset_fill:
-                        sheet.Cells.Interior.Pattern = -4142  # xlPatternNone; retain Table styles and conditional formats.
+                        if exclude_table_headers:
+                            _reset_fills_except_table_headers(sheet)
+                        else:
+                            sheet.Cells.Interior.Pattern = -4142  # xlPatternNone; retain Table styles and conditional formats.
                     progress(1, 1, sheet_name)
                     _save_xlsx(workbook, temp)
                 finally:

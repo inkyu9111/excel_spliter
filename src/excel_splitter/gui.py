@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .controller import AppController, UiState
-from .errors import ExcelSplitterError
+from .errors import ExcelSplitterError, WorkbookValidationError
 from .models import Preview, SplitResult
 from .parallel_writer import ParallelWriteAborted
 
@@ -195,6 +195,21 @@ class ExcelSplitterGui:
     def _preview(self) -> None:
         self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
+        output_dir = self.controller.state.output_dir
+        if output_dir is not None:
+            try:
+                if not output_dir.exists():
+                    prompt = f"폴더가 존재하지 않습니다. 만드시겠습니까?\n\n{output_dir}"
+                    if not messagebox.askyesno("폴더 생성", prompt, parent=self.root):
+                        return
+                    output_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._handle_error(
+                    WorkbookValidationError(
+                        f"출력 폴더를 확인하거나 만들 수 없습니다: {output_dir}\n{exc}"
+                    )
+                )
+                return
         self._start_worker(lambda: ("preview", self.controller.create_preview()))
 
     def _split(self) -> None:

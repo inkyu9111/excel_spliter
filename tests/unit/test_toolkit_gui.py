@@ -271,8 +271,8 @@ def test_etc_loads_sheets_and_saves_selected_operations_to_new_file(toolkit, mon
         assert path == source
         return ("Keep", "Clean")
 
-    def execute(path, sheet_name, target, *, remove_artifacts, reset_fill, progress):
-        calls.append((path, sheet_name, target, remove_artifacts, reset_fill))
+    def execute(path, sheet_name, target, *, remove_artifacts, reset_fill, exclude_table_headers, progress):
+        calls.append((path, sheet_name, target, remove_artifacts, reset_fill, exclude_table_headers))
         progress(1, 1, sheet_name)
         return target
 
@@ -295,7 +295,7 @@ def test_etc_loads_sheets_and_saves_selected_operations_to_new_file(toolkit, mon
     assert str(gui.etc_sheet_combo["state"]) == "disabled"
     assert str(gui.etc_button["state"]) == "disabled"
     complete_worker(gui)
-    assert calls == [(source, "Clean", output, True, True)]
+    assert calls == [(source, "Clean", output, True, True, True)]
     assert str(output) in messages[0]
     assert all(gui.notebook.tab(index, "state") == "normal" for index in range(3))
 
@@ -339,6 +339,56 @@ def test_etc_options_work_independently_and_new_file_clears_stale_sheets(toolkit
     gui._handle_error(WorkbookValidationError("protected sheet"))
     assert not gui._busy and "오류" in gui.etc_status_var.get()
     assert str(gui.etc_button["state"]) == "normal"
+
+
+def test_etc_table_header_option_defaults_forwards_and_locks_while_busy(toolkit, monkeypatch, tmp_path):
+    gui, _ = toolkit
+    gui.notebook.select(3)
+    gui.etc_source_var.set(str(tmp_path / "source.xlsx"))
+    gui.etc_output_var.set(str(tmp_path / "result.xlsx"))
+    gui._handle_ok(("etc_source", ("Data",)))
+    assert gui.etc_exclude_table_headers_var.get()
+    assert gui.etc_reset_fill_checkbox.grid_info()["row"] == gui.etc_exclude_table_headers_checkbox.grid_info()["row"]
+    assert gui.etc_reset_fill_checkbox.grid_info()["column"] < gui.etc_exclude_table_headers_checkbox.grid_info()["column"]
+    assert str(gui.etc_button["state"]) == "disabled"
+    calls = []
+
+    def execute(source, sheet_name, target, **options):
+        calls.append(options["exclude_table_headers"])
+        return target
+
+    gui.etc_service = SimpleNamespace(execute=execute)
+    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda *_, **__: None)
+    gui.etc_reset_fill_var.set(True)
+    gui.etc_exclude_table_headers_var.set(False)
+    gui._render_etc_state()
+    assert str(gui.etc_button["state"]) == "normal"
+    gui._run_etc()
+    assert str(gui.etc_exclude_table_headers_checkbox["state"]) == "disabled"
+    complete_worker(gui)
+    assert calls == [False]
+    assert not gui.etc_exclude_table_headers_checkbox.instate(["disabled"])
+
+
+def test_etc_table_header_option_is_enabled_only_when_reset_fill_is_checked(toolkit):
+    gui, _ = toolkit
+    header = gui.etc_exclude_table_headers_checkbox
+    assert header.instate(["disabled"]) and gui.etc_exclude_table_headers_var.get()
+    header.invoke()
+    assert gui.etc_exclude_table_headers_var.get()
+
+    gui.etc_reset_fill_checkbox.invoke()
+    assert not header.instate(["disabled"])
+    header.invoke()
+    assert not gui.etc_exclude_table_headers_var.get()
+
+    gui.etc_reset_fill_checkbox.invoke()
+    assert header.instate(["disabled"])
+    gui._set_busy(True)
+    gui._set_busy(False)
+    assert header.instate(["disabled"]) and not gui.etc_exclude_table_headers_var.get()
+    gui.etc_reset_fill_checkbox.invoke()
+    assert not header.instate(["disabled"]) and not gui.etc_exclude_table_headers_var.get()
 
 
 def test_output_entries_edit_state_without_key_events(toolkit, monkeypatch, tmp_path):
