@@ -100,6 +100,58 @@ def test_running_merge_blocks_split_and_close_then_restores(toolkit, monkeypatch
     assert gui.notebook.tab(1, "state") == "normal"
 
 
+def test_notebook_tab_extents_identified_by_ttk_stay_stable_when_selection_changes(toolkit):
+    gui, _ = toolkit
+    root = gui.root
+    root.deiconify()
+    root.geometry("740x520")
+    root.update()
+
+    def tab_extents():
+        found = {index: [] for index in range(len(gui.notebook.tabs()))}
+        for y in range(36):
+            for x in range(gui.notebook.winfo_width()):
+                if gui.notebook.identify(x, y):
+                    found[gui.notebook.index(f"@{x},{y}")].append((x, y))
+        return [
+            (min(x for x, _ in points), max(x for x, _ in points),
+             min(y for _, y in points), max(y for _, y in points))
+            for points in found.values()
+        ]
+
+    baseline = tab_extents()
+
+    for index in range(len(gui.notebook.tabs())):
+        gui.notebook.select(index)
+        root.update()
+        assert tab_extents() == baseline
+
+    root.withdraw()
+
+
+def test_preview_worker_does_not_switch_the_active_progress_bar_to_indeterminate(toolkit, monkeypatch):
+    gui, _ = toolkit
+    add_files(gui, monkeypatch)
+    gui._preview_merge()
+    assert str(gui.merge_progress["mode"]) == "determinate"
+    complete_worker(gui)
+
+
+def test_execution_reconfigures_each_selected_progress_bar(toolkit):
+    gui, _ = toolkit
+    gui._progress_mode = "indeterminate"
+    gui._progress_running = False
+    gui.notebook.select(3)
+    gui.etc_progress.configure(mode="determinate")
+
+    gui._start_worker(lambda: ("noop", None), execution=True)
+
+    assert str(gui.etc_progress["mode"]) == "indeterminate"
+    assert gui.events.get(timeout=1) == ("ok", ("noop", None))
+    gui._set_busy(False)
+    assert str(gui.etc_progress["mode"]) == "determinate"
+
+
 def test_merge_requires_confirmation_and_consumes_preview(toolkit, monkeypatch):
     gui, calls = toolkit
     add_files(gui, monkeypatch)
@@ -542,6 +594,7 @@ def test_completion_panel_keeps_result_and_merge_handoff_preserves_reference(too
 
 def test_progress_unknown_phase_and_error_details_stay_readable(toolkit, monkeypatch):
     gui, _ = toolkit
+    gui._executing = True
     gui._set_busy(True)
     gui._show_progress(0, 0, "파일 저장 중")
     assert str(gui.merge_progress["mode"]) == "indeterminate"

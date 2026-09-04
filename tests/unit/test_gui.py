@@ -163,10 +163,14 @@ def test_preview_keeps_existing_file_for_backend_output_validation(
 def test_error_dialog_includes_the_configured_log_path(monkeypatch: pytest.MonkeyPatch) -> None:
     gui = ExcelSplitterGui.__new__(ExcelSplitterGui)
     log_path = Path("logs/excel-file-toolkit.log")
-    gui.logger = SimpleNamespace(error=lambda *_args, **_kwargs: None, handlers=[SimpleNamespace(baseFilename=str(log_path))])
+    gui.logger = SimpleNamespace(
+        error=lambda *_args, **_kwargs: None,
+        handlers=[SimpleNamespace(baseFilename=str(log_path), get_name=lambda: "excel_splitter.file")],
+    )
     gui.root = object()
     gui.controller = SimpleNamespace(state=object())
     gui.status_var = SimpleNamespace(set=lambda *_args: None)
+    gui._executing = False
     gui._set_busy = lambda *_args: None
     gui._reset_progress = lambda: None
     gui._render_state = lambda *_args: None

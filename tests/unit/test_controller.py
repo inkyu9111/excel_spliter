@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -50,6 +51,8 @@ class _ProgressDouble:
         self.maximum = maximum
         self.mode = "determinate"
         self.running = False
+        self.starts = 0
+        self.stops = 0
 
     def configure(self, *, maximum: int | None = None, mode: str | None = None) -> None:
         if maximum is not None:
@@ -59,9 +62,11 @@ class _ProgressDouble:
 
     def stop(self) -> None:
         self.running = False
+        self.stops += 1
 
     def start(self, _interval: int) -> None:
         self.running = True
+        self.starts += 1
 
 
 def test_leaving_busy_state_restores_browse_buttons() -> None:
@@ -73,6 +78,9 @@ def test_leaving_busy_state_restores_browse_buttons() -> None:
     gui.status_var = _VariableDouble()
     gui.progress_var = _VariableDouble()
     gui.progress = _ProgressDouble()
+    gui._executing = False
+    gui._progress_mode = None
+    gui._progress_running = False
     gui.controller = SimpleNamespace(state=object())
     gui._render_state = lambda _state: None
 
@@ -81,6 +89,31 @@ def test_leaving_busy_state_restores_browse_buttons() -> None:
 
     assert gui.source_button.state == "normal"
     assert gui.output_button.state == "normal"
+
+
+def test_metadata_worker_stays_idle_while_execution_worker_starts_progress() -> None:
+    gui = object.__new__(ExcelSplitterGui)
+    gui._busy = False
+    gui._input_widgets = []
+    gui.root = _RootDouble()
+    gui.status_var = _VariableDouble()
+    gui.progress_var = _VariableDouble()
+    gui.progress = _ProgressDouble()
+    gui._executing = False
+    gui._progress_mode = None
+    gui._progress_running = False
+    gui.controller = SimpleNamespace(state=object())
+    gui.events = queue.Queue()
+    gui._render_state = lambda _state: None
+
+    gui._start_worker(lambda: ("inspect", None))
+    assert gui.events.get(timeout=1) == ("ok", ("inspect", None))
+    assert gui.progress.starts == 0
+    gui._set_busy(False)
+
+    gui._start_worker(lambda: ("execute", None), execution=True)
+    assert gui.events.get(timeout=1) == ("ok", ("execute", None))
+    assert gui.progress.starts == 1
 
 
 def test_idle_window_close_shuts_down_session_before_destroy() -> None:
@@ -109,6 +142,7 @@ def test_parallel_abort_error_reports_partial_and_unstarted_counts(
     gui.result_panels = {}
     gui.progress_var = _VariableDouble()
     gui.progress = _ProgressDouble()
+    gui._executing = False
     gui.status_var = SimpleNamespace(set=lambda _value: None)
     partial = SplitResult((Path("done.xlsx"),), ())
     error = ParallelWriteAborted("worker failed", partial, (Path("later.xlsx"),))
@@ -150,6 +184,9 @@ def test_error_resets_progress_and_next_progress_update_still_works(
     gui._started_at = 0.0
     gui.progress_var = _VariableDouble()
     gui.progress = _ProgressDouble()
+    gui._executing = True
+    gui._progress_mode = None
+    gui._progress_running = False
     gui.status_var = _VariableDouble()
 
     def show_error(*_args: object, **_kwargs: object) -> None:

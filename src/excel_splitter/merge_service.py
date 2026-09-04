@@ -21,6 +21,7 @@ from .excel_gateway import (
 )
 from .file_signature import capture_signature, same_signature
 from .models import FileSignature
+from .merge_conditional_formats import restore_full_column_rule
 from .naming import _INVALID_CHARACTERS
 from .ports import ProgressCallback
 from .split_service import _validate_output_dir, _validate_source_path
@@ -265,4 +266,5 @@ def _write_merged(temp: Path, preview: MergePreview, progress: ProgressCallback)
         finally:
             _close_without_saving(workbook)
         progress(0, 0, "저장 결과 확인 중")
+        restore_full_column_rule(tuple(item.source for item in preview.inputs), temp)
         _verify_xlsx_package(temp)

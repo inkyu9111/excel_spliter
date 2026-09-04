@@ -12,6 +12,51 @@ from excel_splitter.file_signature import capture_signature
 from excel_splitter.merge_service import MergeService
 
 
+def check_full_column_rule(root: Path) -> None:
+    sources = tuple(root / f"cf-part-{index}.xlsx" for index in range(15))
+    with _excel_session() as excel:
+        for source in sources:
+            book = excel.Workbooks.Add()
+            try:
+                while book.Worksheets.Count > 1:
+                    book.Worksheets.Item(book.Worksheets.Count).Delete()
+                sheet = book.Worksheets.Item(1)
+                sheet.Name = "Data"
+                sheet.Range("A1:H1").Value2 = (tuple(f"Column{i}" for i in range(1, 9)),)
+                sheet.Range("A2:H3").Value2 = (tuple(range(1, 9)), tuple(range(11, 19)))
+                sheet.ListObjects.Add(1, sheet.Range("A1:H3"), None, 1).Name = "DataTable"
+                rule = sheet.Range("H:H").FormatConditions.Add(Type=2, Formula1="=$H1>0")
+                rule.StopIfTrue = True
+                rule.Font.Bold = True
+                rule.Font.Color = 255
+                rule.Interior.Color = 65535
+                rule.NumberFormat = "0.0000"
+                book.SaveAs(str(source), FileFormat=51)
+            finally:
+                book.Close(SaveChanges=False)
+    before = tuple(capture_signature(source) for source in sources)
+    service = MergeService()
+    output = service.execute(service.preview(sources, root / "cf-merged.xlsx"),
+                             overwrite=False, progress=lambda *_: None)
+    assert tuple(capture_signature(source) for source in sources) == before
+    with _excel_session() as excel:
+        book = _open_workbook(excel, output, read_only=True)
+        try:
+            sheet = book.Worksheets.Item(1)
+            assert sheet.ListObjects.Item(1).ListRows.Count == 30
+            assert sheet.Cells.FormatConditions.Count == 1
+            rule = sheet.Cells.FormatConditions.Item(1)
+            assert rule.AppliesTo.Address == "$H:$H"
+            assert rule.Formula1 == "=$H1>0"
+            assert rule.Priority == 1 and rule.StopIfTrue
+            assert rule.Font.Bold and rule.Font.Color == 255
+            assert rule.Interior.Color == 65535 and rule.NumberFormat == "0.0000"
+            assert sheet.Range("H31").DisplayFormat.Interior.Color == 65535
+            assert book.LinkSources(1) is None
+        finally:
+            book.Close(SaveChanges=False)
+
+
 def main() -> None:
     with TemporaryDirectory(prefix="merge-excel-check-") as directory:
         root = Path(directory)
@@ -87,7 +132,8 @@ def main() -> None:
             finally:
                 book.Close(SaveChanges=False)
         assert set(root.rglob("*.xlsx")) == {*sources, output}
-    print("PASS: native Merge values, duplicates, formulas, formats, totals, filtered/hidden rows, styled blank expansion, outside content, and unchanged inputs")
+        check_full_column_rule(root)
+    print("PASS: native Merge values, duplicates, formulas, formats, totals, filtered/hidden rows, styled blank expansion, outside content, unchanged inputs, and one $H:$H rule after merging 15 files")
 
 
 if __name__ == "__main__":

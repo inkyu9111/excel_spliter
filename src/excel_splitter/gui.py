@@ -18,6 +18,8 @@ from .models import Preview, SplitResult
 from .parallel_writer import ParallelWriteAborted
 from .ui_helpers import describe_error, format_elapsed, validate_output_path
 
+LOG_HANDLER_NAME = "excel_splitter.file"
+
 DELETED_SHEETS_WARNING = (
     "선택한 시트를 제외한 다른 시트를 삭제합니다. 삭제되는 시트에 의존하는 "
     "수식, 이름, 차트, 유효성 검사 및 연결이 손상될 수 있습니다."
@@ -27,7 +29,7 @@ UNEXPECTED_ERROR_MESSAGE = "처리 중 예상하지 못한 오류가 발생했�
 
 def configure_logging() -> logging.Logger:
     logger = logging.getLogger("excel_splitter")
-    if logger.handlers:
+    if any(handler.get_name() == LOG_HANDLER_NAME for handler in logger.handlers):
         return logger
     local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home()))
     log_dir = local_app_data / "ExcelFileToolkit" / "logs"
@@ -38,15 +40,27 @@ def configure_logging() -> logging.Logger:
         backupCount=3,
         encoding="utf-8",
     )
+    handler.set_name(LOG_HANDLER_NAME)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     return logger
 
 
+def shutdown_logging() -> None:
+    logger = logging.getLogger("excel_splitter")
+    for handler in tuple(logger.handlers):
+        if handler.get_name() == LOG_HANDLER_NAME:
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def _log_path(logger: logging.Logger) -> Path:
     for handler in getattr(logger, "handlers", ()):
-        if path := getattr(handler, "baseFilename", None):
+        if (
+            handler.get_name() == LOG_HANDLER_NAME
+            and (path := getattr(handler, "baseFilename", None))
+        ):
             return Path(path)
     local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home()))
     return local_app_data / "ExcelFileToolkit" / "logs" / "excel-file-toolkit.log"
@@ -63,6 +77,9 @@ class ExcelSplitterGui:
         self._started_at = 0.0
         self._phase = "준비 중"
         self._phase_count = ""
+        self._executing = False
+        self._progress_mode: str | None = None
+        self._progress_running = False
         self.result_paths = {}
         self.result_panels = {}
 
@@ -251,11 +268,15 @@ class ExcelSplitterGui:
             )
             return ("execute", result)
 
-        self._start_worker(execute)
+        self._start_worker(execute, execution=True)
 
-    def _start_worker(self, action: Callable[[], object]) -> None:
+    def _start_worker(self, action: Callable[[], object], *, execution: bool = False) -> None:
         if self._busy:
             return
+        self._executing = execution
+        if execution:
+            self._progress_mode = None
+            self._progress_running = False
         self._set_busy(True)
 
         def run() -> None:
@@ -298,6 +319,7 @@ class ExcelSplitterGui:
             self._show_summary(value)
             self._render_state(self.controller.state)
     def _handle_error(self, error: object) -> None:
+        was_executing = self._executing
         self._set_busy(False)
         exc = error if isinstance(error, Exception) else Exception(str(error))
         self.logger.error(
@@ -321,24 +343,40 @@ class ExcelSplitterGui:
             self.error_text.configure(state="disabled")
             self.error_text.grid_remove()
             self.error_panel.grid()
-        self._reset_progress()
+        if was_executing:
+            self._reset_progress()
         if not hasattr(self, "error_panel"):
             messagebox.showerror("오류", message, parent=self.root)
         self._render_state(self.controller.state)
         self.status_var.set("오류가 발생했습니다.")
 
     def _reset_progress(self) -> None:
-        self.progress.stop()
-        self.progress.configure(maximum=1)
+        self._progress_widget().stop()
+        self._progress_mode = "determinate"
+        self._progress_running = False
+        self._progress_widget().configure(maximum=1, mode="determinate")
         self.progress_var.set(0)
 
+    def _progress_widget(self) -> ttk.Progressbar:
+        return self.progress
+
     def _show_progress(self, completed: int, total: int, label: str) -> None:
+        if not self._executing:
+            return
         self._phase = label or "처리 중"
         self._phase_count = f" ({completed}/{total})" if total > 0 else ""
-        self.progress.stop()
-        self.progress.configure(maximum=max(total, 1), mode="determinate" if total > 0 else "indeterminate")
-        if total <= 0:
-            self.progress.start(15)
+        progress = self._progress_widget()
+        mode = "determinate" if total > 0 else "indeterminate"
+        if self._progress_mode != mode:
+            progress.configure(mode=mode)
+            self._progress_mode = mode
+        progress.configure(maximum=max(total, 1))
+        if total <= 0 and not self._progress_running:
+            progress.start(15)
+            self._progress_running = True
+        elif total > 0 and self._progress_running:
+            progress.stop()
+            self._progress_running = False
         self.progress_var.set(completed)
         self._update_elapsed()
 
@@ -413,7 +451,8 @@ class ExcelSplitterGui:
         if busy:
             self._started_at = time.monotonic()
             self._phase, self._phase_count = "준비 중", ""
-            self._show_progress(0, 0, self._phase)
+            if self._executing:
+                self._show_progress(0, 0, self._phase)
             if hasattr(self, "error_panel"):
                 self.error_panel.grid_remove()
             for widget in self._input_widgets:
@@ -421,11 +460,18 @@ class ExcelSplitterGui:
             self.root.protocol("WM_DELETE_WINDOW", lambda: None)
             self.status_var.set("처리 중입니다...")
         else:
-            self.progress.stop()
+            if self._progress_running:
+                self._progress_widget().stop()
+                self._progress_running = False
+            if self._executing and self._progress_mode == "indeterminate":
+                self._progress_widget().configure(maximum=1, mode="determinate")
+                self.progress_var.set(0)
+                self._progress_mode = "determinate"
             for widget in self._input_widgets:
                 widget.configure(state="normal")
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
             self._render_state(self.controller.state)
+            self._executing = False
 
     def _open_path(self, path: Path) -> None:
         try:
@@ -504,4 +550,7 @@ class ExcelSplitterGui:
         except Exception:
             self.logger.exception("source session 종료 실패")
         finally:
-            self.root.destroy()
+            try:
+                shutdown_logging()
+            finally:
+                self.root.destroy()

@@ -52,13 +52,14 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         style.configure("TCombobox", fieldbackground="#ffffff", background="#f7f9fa", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=5)
         style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")])
         style.configure("Horizontal.TProgressbar", troughcolor="#eef2f1", background="#18754c", bordercolor="#eef2f1", lightcolor="#18754c", darkcolor="#18754c")
-        style.configure("TButton", padding=(12, 8), background="#ffffff")
-        style.configure("Primary.TButton", background="#18754c", foreground="white", padding=(20, 10))
+        style.configure("TButton", padding=(8, 4), background="#ffffff")
+        style.configure("Primary.TButton", background="#18754c", foreground="white", padding=(14, 6))
         style.map("Primary.TButton", background=[("disabled", "#e4ece7"), ("active", "#105d3b")],
                   foreground=[("disabled", "#718279")])
         style.configure("TNotebook", background="#ffffff", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(24, 10))
-        style.map("TNotebook.Tab", background=[("selected", "#edf5f0")], foreground=[("selected", "#18754c")])
+        style.configure("TNotebook.Tab", padding=(16, 6))
+        style.map("TNotebook.Tab", padding=[("selected", (16, 6)), ("!selected", (16, 6))],
+                  background=[("selected", "#edf5f0")], foreground=[("selected", "#18754c")])
         style.configure("Treeview", rowheight=30, fieldbackground="#ffffff", bordercolor="#d5dde3")
         style.configure("Treeview.Heading", padding=8, background="#f3f6f8")
         style.configure("Section.TLabel", font=("맑은 고딕", 12, "bold"))
@@ -202,10 +203,10 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             button.grid(row=0, column=2, padx=(6, 0))
             buttons.append(button)
         ttk.Button(actions, text="설정으로 돌아가기", command=lambda: page.master.yview_moveto(0)).grid(
-            row=0, column=3, padx=(6, 0))
+            row=0, column=2 if kind in ("split", "compare") else 3, padx=(6, 0))
         if kind in ("split", "compare"):
             ttk.Button(actions, text="선택 내역 상세 보기", command=lambda: self._show_result_detail(kind)).grid(
-                row=1, column=0, columnspan=4, sticky="e", pady=(6, 0))
+                row=0, column=3, padx=(6, 0))
         self._input_widgets.extend(buttons)
         self.result_panels[kind] = (frame, label, tree, buttons)
         frame.grid_remove()
@@ -376,7 +377,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             exclude_table_headers=exclude_table_headers,
             remove_conditional_formats=remove_conditional_formats,
             progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
-        )))
+        )), execution=True)
 
     def _build_compare(self) -> None:
         page = self._page("비교")
@@ -527,7 +528,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._start_worker(lambda: ("compare_execute", self.compare_service.execute(
             reference, comparison, target, **options,
             progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
-        )))
+        )), execution=True)
 
     def _render_merge_state(self) -> None:
         error = self._output_error("merge", self.merge_sources)
@@ -645,7 +646,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._start_worker(lambda: ("merge_execute", self.merge_service.execute(
             preview, preview.prior_signature is not None,
             lambda completed, total, label: self.events.put(("progress", completed, total, label)),
-        )))
+        )), execution=True)
 
     def _set_busy(self, busy: bool) -> None:
         super()._set_busy(busy)
@@ -653,8 +654,6 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         for tab in self.notebook.tabs():
             self.notebook.tab(tab, state="disabled" if busy and tab != selected else "normal")
         if not busy:
-            for bar in (self.merge_progress, self.compare_progress, self.etc_progress):
-                bar.stop()
             for kind, (_, _, _, buttons) in self.result_panels.items():
                 for button in buttons:
                     button.configure(state="normal" if self.result_paths.get(kind) else "disabled")
@@ -740,22 +739,10 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         status = (self.status_var, self.merge_status_var, self.compare_status_var, self.etc_status_var)[selected]
         status.set("오류가 발생했습니다. 아래 안내를 확인하고 다시 실행하세요.")
 
-    def _reset_progress(self) -> None:
-        super()._reset_progress()
-        for bar in (self.merge_progress, self.compare_progress, self.etc_progress):
-            bar.stop()
-            bar.configure(maximum=1)
-
-    def _show_progress(self, completed: int, total: int, label: str) -> None:
-        super()._show_progress(completed, total, label)
-        selected = self.notebook.index(self.notebook.select())
-        for index, bar in enumerate((self.merge_progress, self.compare_progress, self.etc_progress), 1):
-            bar.stop()
-            bar.configure(maximum=max(total, 1), mode="determinate" if total > 0 else "indeterminate")
-            if index == selected and total <= 0:
-                bar.start(15)
-        if selected != 0:
-            self.progress.stop()
+    def _progress_widget(self) -> ttk.Progressbar:
+        return (self.progress, self.merge_progress, self.compare_progress, self.etc_progress)[
+            self.notebook.index(self.notebook.select())
+        ]
 
     def _update_elapsed(self) -> None:
         super()._update_elapsed()
