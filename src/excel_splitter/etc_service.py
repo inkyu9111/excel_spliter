@@ -73,6 +73,7 @@ class EtcService:
         if not remove_artifacts and not reset_fill and not remove_conditional_formats:
             raise WorkbookValidationError("실행할 정리 작업을 하나 이상 선택하세요.")
         source, target = Path(source).resolve(), Path(target).absolute()
+        progress(0, 0, "원본 확인 중")
         _validate_paths(source, source, target)
         target = target.resolve()
         signature = capture_signature(source)
@@ -80,10 +81,12 @@ class EtcService:
         os.close(descriptor)
         temp = Path(filename)
         try:
+            progress(0, 0, "파일 복사 중")
             shutil.copy2(source, temp)
             temp.chmod(stat.S_IREAD | stat.S_IWRITE)
             if capture_signature(temp) != signature:
                 raise WorkbookValidationError("원본 파일을 복사하는 동안 변경되었습니다.")
+            progress(0, 0, "정리 작업 중")
             with _excel_session() as excel:
                 workbook = _open_workbook(excel, temp, read_only=False)
                 try:
@@ -100,15 +103,17 @@ class EtcService:
                     if remove_conditional_formats:
                         with _com_stage(f"조건부 서식 삭제: {sheet_name}"):
                             sheet.Cells.FormatConditions.Delete()
-                    progress(1, 1, sheet_name)
+                    progress(0, 0, "결과 저장 중")
                     _save_xlsx(workbook, temp)
                 finally:
                     _close_without_saving(workbook)
+            progress(0, 0, "저장 결과 확인 중")
             _verify_xlsx_package(temp)
             _validate_paths(source, source, target)
             if not same_signature(source, signature):
                 raise WorkbookValidationError("정리하는 동안 원본이 변경되었습니다.")
             _publish_temp(temp, target, None)
+            progress(1, 1, "완료")
             return target
         finally:
             active_error = sys.exception()

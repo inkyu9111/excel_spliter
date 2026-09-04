@@ -4,6 +4,8 @@ import logging
 import os
 import queue
 import threading
+import time
+import traceback
 import tkinter as tk
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
@@ -14,6 +16,7 @@ from .controller import AppController, UiState
 from .errors import ExcelSplitterError, WorkbookValidationError
 from .models import Preview, SplitResult
 from .parallel_writer import ParallelWriteAborted
+from .ui_helpers import describe_error, format_elapsed, validate_output_path
 
 DELETED_SHEETS_WARNING = (
     "선택한 시트를 제외한 다른 시트를 삭제합니다. 삭제되는 시트에 의존하는 "
@@ -57,6 +60,11 @@ class ExcelSplitterGui:
         self.events: queue.Queue[tuple[object, ...]] = queue.Queue()
         self._busy = False
         self._input_widgets: list[tk.Widget] = []
+        self._started_at = 0.0
+        self._phase = "준비 중"
+        self._phase_count = ""
+        self.result_paths = {}
+        self.result_panels = {}
 
         self.source_var = tk.StringVar()
         self.sheet_var = tk.StringVar()
@@ -246,6 +254,8 @@ class ExcelSplitterGui:
         self._start_worker(execute)
 
     def _start_worker(self, action: Callable[[], object]) -> None:
+        if self._busy:
+            return
         self._set_busy(True)
 
         def run() -> None:
@@ -269,6 +279,8 @@ class ExcelSplitterGui:
                     self._handle_error(event[1])
         except queue.Empty:
             pass
+        if self._busy:
+            self._update_elapsed()
         self.root.after(75, self.poll_queue)
 
     def _handle_ok(self, payload: object) -> None:
@@ -292,29 +304,47 @@ class ExcelSplitterGui:
             "GUI 작업 실패",
             exc_info=(type(exc), exc, exc.__traceback__),
         )
+        reason, action = describe_error(exc)
+        message = f"{reason}\n{action}"
         if isinstance(exc, ParallelWriteAborted):
-            message = (
-                f"{exc}\n\n완료 {len(exc.partial_result.succeeded)}개, "
-                f"실패 {len(exc.partial_result.failed)}개, "
-                f"시작하지 못함 {len(exc.unstarted)}개"
-            )
-        else:
-            message = str(exc) if isinstance(exc, ExcelSplitterError) else UNEXPECTED_ERROR_MESSAGE
+            message += (f"\n완료 {len(exc.partial_result.succeeded)}개, "
+                        f"실패 {len(exc.partial_result.failed)}개, 시작하지 못함 {len(exc.unstarted)}개")
+            if hasattr(self, "error_panel"):
+                self._show_summary(exc.partial_result)
         message += f"\n\n자세한 내용: {_log_path(self.logger)}"
+        self.error_detail = "".join(traceback.format_exception(exc)) + f"\n로그: {_log_path(self.logger)}"
+        if hasattr(self, "error_panel"):
+            self.error_message_var.set(f"{reason}  {action}")
+            self.error_text.configure(state="normal")
+            self.error_text.delete("1.0", "end")
+            self.error_text.insert("1.0", self.error_detail)
+            self.error_text.configure(state="disabled")
+            self.error_text.grid_remove()
+            self.error_panel.grid()
         self._reset_progress()
-        messagebox.showerror("오류", message, parent=self.root)
+        if not hasattr(self, "error_panel"):
+            messagebox.showerror("오류", message, parent=self.root)
         self._render_state(self.controller.state)
         self.status_var.set("오류가 발생했습니다.")
 
     def _reset_progress(self) -> None:
+        self.progress.stop()
         self.progress.configure(maximum=1)
         self.progress_var.set(0)
 
     def _show_progress(self, completed: int, total: int, label: str) -> None:
-        self.progress.configure(maximum=max(total, 1))
+        self._phase = label or "처리 중"
+        self._phase_count = f" ({completed}/{total})" if total > 0 else ""
+        self.progress.stop()
+        self.progress.configure(maximum=max(total, 1), mode="determinate" if total > 0 else "indeterminate")
+        if total <= 0:
+            self.progress.start(15)
         self.progress_var.set(completed)
-        shown = label if label else "∅ (빈 셀)"
-        self.status_var.set(f"처리 중: {shown} ({completed}/{total})")
+        self._update_elapsed()
+
+    def _update_elapsed(self) -> None:
+        elapsed = format_elapsed(max(0, time.monotonic() - self._started_at))
+        self.status_var.set(f"{self._phase}{self._phase_count} · 경과 {elapsed}")
 
     def _render_preview(self, preview: Preview) -> None:
         self._clear_preview()
@@ -326,6 +356,15 @@ class ExcelSplitterGui:
             )
 
     def _show_summary(self, result: SplitResult) -> None:
+        if "split" in self.result_panels:
+            rows = [("완료", path.name, "", "", str(path)) for path in result.succeeded]
+            rows.extend(("실패", failure.label, "", "", failure.message) for failure in result.failed)
+            self._show_result("split", tuple(result.succeeded),
+                              f"분할 완료 · 성공 {len(result.succeeded)}개 · 실패 {len(result.failed)}개", rows)
+            self._clear_preview()
+            self.controller.set_pattern(self.pattern_var.get())
+            self.status_var.set("분할 작업이 끝났습니다. 다시 실행하려면 미리보기를 확인하세요.")
+            return
         lines = ["성공 파일:"]
         lines.extend(str(path) for path in result.succeeded)
         if not result.succeeded:
@@ -360,21 +399,102 @@ class ExcelSplitterGui:
         ready = all(
             (state.source, state.sheet_name, state.column_name, state.output_dir)
         )
+        error = validate_output_path(self.output_var.get(), directory=True)
+        if hasattr(self, "split_path_note"):
+            missing = bool(state.output_dir and not state.output_dir.exists())
+            self.split_path_note.set(error or ("없는 폴더입니다. 미리보기에서 생성 여부를 확인합니다." if missing else "분할 결과를 이 폴더에 저장합니다."))
+            self.split_reason_var.set("" if ready and not error else error or "원본 파일, 시트와 분류 컬럼을 선택하세요.")
+        ready = ready and not error
         self.preview_button.configure(state="normal" if ready else "disabled")
         self.split_button.configure(state="normal" if state.preview else "disabled")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         if busy:
+            self._started_at = time.monotonic()
+            self._phase, self._phase_count = "준비 중", ""
+            self._show_progress(0, 0, self._phase)
+            if hasattr(self, "error_panel"):
+                self.error_panel.grid_remove()
             for widget in self._input_widgets:
                 widget.configure(state="disabled")
             self.root.protocol("WM_DELETE_WINDOW", lambda: None)
             self.status_var.set("처리 중입니다...")
         else:
+            self.progress.stop()
             for widget in self._input_widgets:
                 widget.configure(state="normal")
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
             self._render_state(self.controller.state)
+
+    def _open_path(self, path: Path) -> None:
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            self._handle_error(exc)
+
+    def _open_result(self, kind: str, folder: bool = False) -> None:
+        paths = self.result_paths.get(kind, ())
+        if not paths:
+            return
+        path = paths[0]
+        panel = self.result_panels[kind]
+        if kind == "split" and panel[2].selection():
+            values = panel[2].item(panel[2].selection()[0], "values")
+            selected = Path(values[4])
+            if selected in paths:
+                path = selected
+            elif not folder:
+                return
+        self._open_path(path.parent if folder else path)
+
+    def _show_result(self, kind: str, paths: tuple[Path, ...], summary: str, rows=()) -> None:
+        self.result_paths[kind] = paths
+        frame, label, tree, buttons = self.result_panels[kind]
+        label.configure(text=summary + (f"\n{paths[0]}" if paths else ""))
+        tree.delete(*tree.get_children())
+        for row in rows:
+            tree.insert("", "end", values=row)
+        if rows:
+            tree.master.grid()
+        else:
+            tree.master.grid_remove()
+        for button in buttons:
+            button.configure(state="normal" if paths else "disabled")
+        frame.grid()
+        canvas = frame.master.master
+        self.root.after_idle(lambda: (canvas.update_idletasks(), canvas.yview_moveto(1)))
+
+    def _show_result_detail(self, kind: str):
+        tree = self.result_panels[kind][2]
+        selection = tree.selection()
+        if not selection:
+            return None
+        values = tree.item(selection[0], "values")
+        window = tk.Toplevel(self.root)
+        window.title("선택 내역 상세 보기")
+        window.geometry("720x440")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        text = tk.Text(window, wrap="word", padx=14, pady=14)
+        text.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(window, orient="vertical", command=text.yview)
+        bar.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=bar.set)
+        headings = ("구분", "시트 · 키 / 위치", "열", "기준 파일", "대상 파일")
+        text.insert("1.0", "\n\n".join(f"{heading}\n{value}" for heading, value in zip(headings, values)))
+        text.configure(state="disabled")
+        return window
+
+    def _toggle_error_detail(self) -> None:
+        if self.error_text.winfo_manager():
+            self.error_text.grid_remove()
+        else:
+            self.error_text.grid()
+
+    def _copy_error(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.error_detail)
 
     def _on_close(self) -> None:
         if self._busy:

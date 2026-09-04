@@ -119,6 +119,7 @@ class MergeService:
         return preview
 
     def execute(self, preview: MergePreview, overwrite: bool, progress: ProgressCallback) -> Path:
+        progress(0, 0, "원본 확인 중")
         _validate_unchanged(preview)
         if preview.prior_signature is not None and not overwrite:
             raise WorkbookValidationError("기존 파일 덮어쓰기 승인이 필요합니다.")
@@ -127,13 +128,16 @@ class MergeService:
         temp = Path(filename)
         try:
             first = preview.inputs[0]
+            progress(0, 0, "파일 복사 중")
             shutil.copy2(first.source, temp)
             temp.chmod(stat.S_IREAD | stat.S_IWRITE)
             if capture_signature(temp) != first.signature:
                 raise WorkbookValidationError("첫 번째 원본 복사본이 미리보기와 다릅니다.")
+            progress(0, 0, "값 병합 중")
             _write_merged(temp, preview, progress)
             _validate_unchanged(preview)
             _publish_temp(temp, preview.target, preview.prior_signature)
+            progress(1, 1, "완료")
             return preview.target
         finally:
             active_error = sys.exception()
@@ -251,6 +255,7 @@ def _write_merged(temp: Path, preview: MergePreview, progress: ProgressCallback)
                 table.DataBodyRange.PasteSpecial(Paste=-4163)  # xlPasteValues
                 excel.CutCopyMode = False
             sheet.Calculate()
+            progress(0, 0, "결과 저장 중")
             workbook.SaveAs(
                 str(temp), FileFormat=51, Password="", WriteResPassword="",
                 ReadOnlyRecommended=False, AddToMru=False,
@@ -259,4 +264,5 @@ def _write_merged(temp: Path, preview: MergePreview, progress: ProgressCallback)
                 raise SplitExecutionError("병합 결과가 지정한 임시 경로에 저장되지 않았습니다.")
         finally:
             _close_without_saving(workbook)
+        progress(0, 0, "저장 결과 확인 중")
         _verify_xlsx_package(temp)

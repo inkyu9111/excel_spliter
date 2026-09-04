@@ -99,7 +99,14 @@ def test_cleanup_options_affect_only_selected_sheet_and_keep_other_cell_styles(t
     assert selected.Cells.Font.Bold and selected.Cells.Borders.LineStyle == 1 and selected.Cells.NumberFormat == "0.00"
     assert (other.Shapes.Count, other.Comments.Count, other.CommentsThreaded.Count, other.Cells.Interior.Pattern) == (2, 2, 2, 1)
     assert events[0] == ("open", False) and events[-1] == ("close", {"SaveChanges": False})
-    assert progress[-1] == (1, 1, "Selected")
+    assert progress == [
+        (0, 0, "원본 확인 중"),
+        (0, 0, "파일 복사 중"),
+        (0, 0, "정리 작업 중"),
+        (0, 0, "결과 저장 중"),
+        (0, 0, "저장 결과 확인 중"),
+        (1, 1, "완료"),
+    ]
 
 
 def test_conditional_format_removal_is_independent_and_scoped_to_selected_sheet(tmp_path, monkeypatch):
@@ -183,10 +190,10 @@ def test_failure_never_publishes_partial_output_and_closes_copy(tmp_path, monkey
     elif failure == "copy":
         monkeypatch.setattr(etc.shutil, "copy2", lambda _source, temp: temp.write_bytes(b"bad copy"))
 
-    def progress(*_):
-        if failure == "source_changed":
+    def progress(_completed, _total, label):
+        if failure == "source_changed" and label == "결과 저장 중":
             source.write_bytes(b"external change")
-        elif failure == "target_created":
+        elif failure == "target_created" and label == "결과 저장 중":
             target.write_bytes(b"new owner")
 
     expected = SplitExecutionError if failure == "save" else (RuntimeError, WorkbookValidationError, OSError)

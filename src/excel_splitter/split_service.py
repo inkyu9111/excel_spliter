@@ -60,12 +60,14 @@ class SplitService:
         overwrite: bool,
         progress: ProgressCallback,
     ) -> SplitResult:
+        progress(0, 0, "원본 확인 중")
         if capture_signature(preview.snapshot.source) != preview.snapshot.signature:
             raise WorkbookValidationError(
                 "원본 파일이 미리보기 이후 변경되었습니다."
             )
         if preview.collisions and not overwrite:
             raise WorkbookValidationError("기존 파일 덮어쓰기 승인이 필요합니다.")
+        progress(0, 0, "파일 복사 중")
         return self.gateway.write_groups(preview.snapshot, preview.targets, progress)
 
     def shutdown(self) -> None:

@@ -79,6 +79,17 @@ def test_execute_rejects_source_changed_after_preview_before_writing(
     assert not gateway.written
 
 
+def test_execute_reports_source_check_before_group_writing(tmp_path: Path) -> None:
+    source, gateway, service = _service(tmp_path)
+    preview = service.preview(source, "분류", "구분", "%", tmp_path)
+    progress: list[tuple[int, int, str]] = []
+
+    service.execute(preview, overwrite=True, progress=lambda *event: progress.append(event))
+
+    assert progress == [(0, 0, "원본 확인 중"), (0, 0, "파일 복사 중")]
+    assert gateway.written
+
+
 def test_preview_rejects_missing_output_directory_before_building_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

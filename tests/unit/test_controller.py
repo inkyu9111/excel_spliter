@@ -48,9 +48,20 @@ class _VariableDouble:
 class _ProgressDouble:
     def __init__(self, maximum: int = 1) -> None:
         self.maximum = maximum
+        self.mode = "determinate"
+        self.running = False
 
-    def configure(self, *, maximum: int) -> None:
-        self.maximum = maximum
+    def configure(self, *, maximum: int | None = None, mode: str | None = None) -> None:
+        if maximum is not None:
+            self.maximum = maximum
+        if mode is not None:
+            self.mode = mode
+
+    def stop(self) -> None:
+        self.running = False
+
+    def start(self, _interval: int) -> None:
+        self.running = True
 
 
 def test_leaving_busy_state_restores_browse_buttons() -> None:
@@ -60,6 +71,8 @@ def test_leaving_busy_state_restores_browse_buttons() -> None:
     gui._input_widgets = [gui.source_button, gui.output_button]
     gui.root = _RootDouble()
     gui.status_var = _VariableDouble()
+    gui.progress_var = _VariableDouble()
+    gui.progress = _ProgressDouble()
     gui.controller = SimpleNamespace(state=object())
     gui._render_state = lambda _state: None
 
@@ -93,6 +106,7 @@ def test_parallel_abort_error_reports_partial_and_unstarted_counts(
     gui.root = object()
     gui.controller = SimpleNamespace(state=object())
     gui._render_state = lambda _state: None
+    gui.result_panels = {}
     gui.progress_var = _VariableDouble()
     gui.progress = _ProgressDouble()
     gui.status_var = SimpleNamespace(set=lambda _value: None)
@@ -132,6 +146,8 @@ def test_error_resets_progress_and_next_progress_update_still_works(
     gui.root = object()
     gui.controller = SimpleNamespace(state=object())
     gui._render_state = lambda _state: None
+    gui.result_panels = {}
+    gui._started_at = 0.0
     gui.progress_var = _VariableDouble()
     gui.progress = _ProgressDouble()
     gui.status_var = _VariableDouble()

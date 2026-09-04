@@ -22,7 +22,7 @@ def _setup(tmp_path, monkeypatch):
 def test_execute_publishes_only_the_modified_copy(tmp_path, monkeypatch):
     compare, reference, comparison, target = _setup(tmp_path, monkeypatch)
 
-    def write(source, temp, progress):
+    def write(source, temp, progress, _details):
         assert source == reference
         assert temp != target and temp.read_bytes() == b"comparison"
         temp.write_bytes(b"highlighted comparison")
@@ -36,7 +36,7 @@ def test_execute_publishes_only_the_modified_copy(tmp_path, monkeypatch):
     assert target.read_bytes() == b"highlighted comparison"
     assert reference.read_bytes() == b"reference" and comparison.read_bytes() == b"comparison"
     assert set(tmp_path.iterdir()) == {reference, comparison, target}
-    assert progress == [(1, 1, "Data")]
+    assert progress == [(0, 0, "비교 파일 복사"), (1, 1, "Data"), (0, 0, "결과 검증"), (1, 1, "완료")]
 
 
 @pytest.mark.parametrize("target_kind", ["reference", "comparison", "existing", "hardlink", "symlink", "dangling_symlink", "directory", "extension", "brackets"])
@@ -70,7 +70,7 @@ def test_rejects_unsafe_output_before_excel(tmp_path, monkeypatch, target_kind):
 def test_failure_cleans_partial_output_without_overwriting_inputs(tmp_path, monkeypatch, failure):
     compare, reference, comparison, target = _setup(tmp_path, monkeypatch)
 
-    def write(_source, temp, _progress):
+    def write(_source, temp, _progress, _details):
         temp.write_bytes(b"partial")
         if failure == "writer":
             raise RuntimeError("Excel failed")
@@ -152,13 +152,24 @@ def test_writer_compares_types_coordinates_and_sheet_names_then_saves_copy(tmp_p
     monkeypatch.setattr(compare, "_read_values", lambda sheet: sheet.values)
     highlights = {}
     monkeypatch.setattr(compare, "_highlight", lambda sheet, cells: highlights.update({sheet.Name: cells}))
-    changed, missing = compare._write_comparison(reference, target, lambda *_: None)
+    details = compare._ComparisonDetails()
+    stages = []
+    changed, missing = compare._write_comparison(reference, target, lambda *args: stages.append(args), details)
     assert changed == 7 and missing == ("Missing",)
     assert highlights == {
         "Data": [(1, 1), (1, 2), (1, 4), (3, 1), (8, 6), (9, 1)],
         "Added": [(2, 2)],
     }
     assert events == ["close baseline", "save copy", "close copy"]
+    assert details.modified_cells == 4 and details.added_rows == 0
+    removed = next(item for item in details.items if item.cell == "F8")
+    assert (removed.kind, removed.reference_value, removed.comparison_value) == ("missing", "removed", None)
+    assert (removed.reference_cell, removed.comparison_cell) == ("F8", "")
+    added = next(item for item in details.items if item.sheet_name == "Added")
+    assert (added.kind, added.cell, added.comparison_value) == ("added", "B2", "added")
+    assert any(item.kind == "missing" and item.sheet_name == "Missing" for item in details.items)
+    assert any(label.startswith("기준 값 읽기") for _, _, label in stages)
+    assert stages[-1] == (0, 0, "결과 저장")
 
 
 @pytest.mark.parametrize("scalar", [False, True])
@@ -305,7 +316,8 @@ def _key_books(tmp_path, monkeypatch, reference_rows=None, comparison_rows=None)
     def make_sheet(name, table_name, columns, rows, first_row, first_column):
         body = SimpleNamespace(Row=first_row, Column=first_column, Rows=SimpleNamespace(Count=len(rows)), Columns=SimpleNamespace(Count=len(columns)))
         table = SimpleNamespace(Name=table_name, ListColumns=_Collection(*(SimpleNamespace(Name=name) for name in columns)),
-                                ListRows=SimpleNamespace(Count=len(rows)), DataBodyRange=body if rows else None)
+                                ListRows=SimpleNamespace(Count=len(rows)), DataBodyRange=body if rows else None,
+                                HeaderRowRange=SimpleNamespace(Row=first_row - 1, Column=first_column))
 
         def read(first, last):
             selected = tuple(tuple(rows[row - first_row][column - first_column] for column in range(first[1], last[1] + 1))
@@ -437,3 +449,66 @@ def test_empty_tables_need_no_body_range_and_report_all_removed_keys(tmp_path, m
     result = compare.CompareService().execute(reference, comparison, target, progress=lambda *_: None, key_columns=("Part", "Code"))
     assert result.changed_cells == 0 and result.missing_rows == 3
     assert highlights == {"Current": []}
+
+
+def test_key_details_distinguish_modified_added_and_missing_with_source_coordinates(tmp_path, monkeypatch):
+    compare, reference, comparison, target, *_ = _key_books(tmp_path, monkeypatch)
+    result = compare.CompareService().execute(reference, comparison, target, progress=lambda *_: None,
+        key_columns=("Part", "Code"))
+    assert (result.changed_cells, result.modified_cells, result.added_rows, result.missing_rows) == (6, 1, 1, 1)
+    changed = next(detail for detail in result.details if detail.kind == "changed")
+    assert (changed.sheet_name, changed.cell, changed.column_name) == ("Current", "E8", "Amount")
+    assert (changed.reference_cell, changed.comparison_cell) == ("D5", "E8")
+    assert (changed.reference_value, changed.comparison_value) == (20, 21)
+    assert changed.key == "Part='a', Code='bc'"
+    added_row = next(detail for detail in result.details if detail.kind == "added" and not detail.column_name)
+    assert (added_row.cell, added_row.key) == ("E10", "Part='added', Code='y'")
+    missing_row = next(detail for detail in result.details if detail.kind == "missing" and not detail.column_name)
+    assert (missing_row.sheet_name, missing_row.reference_cell, missing_row.comparison_cell) == ("Baseline", "B6", "")
+    assert missing_row.key == "Part='gone', Code='x'"
+    missing_column = next(detail for detail in result.details if detail.kind == "missing" and detail.column_name)
+    assert (missing_column.column_name, missing_column.reference_cell) == ("Removed", "E3")
+    assert not result.details_truncated and result.omitted_details == 0
+
+
+def test_detail_limit_preserves_complete_counts(tmp_path, monkeypatch):
+    old = [(str(index), "k", index, None) for index in range(1100)]
+    new = [(index + 1, "k", str(index), None) for index in range(1100)]
+    compare, reference, comparison, target, *_ = _key_books(tmp_path, monkeypatch, old, new)
+    result = compare.CompareService().execute(reference, comparison, target, progress=lambda *_: None,
+        key_columns=("Part", "Code"))
+    assert (result.changed_cells, result.modified_cells) == (1100, 1100)
+    assert len(result.details) == 1000
+    assert result.details_truncated and result.omitted_details == 101  # 1100 changed cells + missing column
+
+
+def test_hidden_table_header_does_not_invent_a_missing_column_coordinate(tmp_path, monkeypatch):
+    compare, reference, comparison, target, baseline, *_ = _key_books(tmp_path, monkeypatch)
+    baseline.Worksheets.Item(1).ListObjects.Item(1).HeaderRowRange = None
+    result = compare.CompareService().execute(reference, comparison, target, progress=lambda *_: None,
+        key_columns=("Part", "Code"))
+    missing_column = next(detail for detail in result.details if detail.kind == "missing" and detail.column_name)
+    assert missing_column.column_name == "Removed" and missing_column.reference_cell == ""
+
+
+def test_key_progress_reports_stages_before_work_and_only_finishes_after_publication(tmp_path, monkeypatch):
+    compare, reference, comparison, target, _baseline, current, _events, _highlights = _key_books(tmp_path, monkeypatch)
+    progress = []
+    save = current.SaveAs
+
+    def observed_save(*args, **kwargs):
+        assert progress[-1] == (0, 0, "결과 저장")
+        save(*args, **kwargs)
+
+    current.SaveAs = observed_save
+
+    def update(completed, total, label):
+        assert total == 0 or 0 <= completed <= total
+        if label == "완료":
+            assert target.exists()
+        progress.append((completed, total, label))
+
+    compare.CompareService().execute(reference, comparison, target, progress=update, key_columns=("Part", "Code"))
+    for label in ("기준 파일 열기", "기준 값 읽기", "비교 파일 열기", "비교 값 읽기", "차이 비교", "노란색 표시", "결과 저장", "결과 검증", "완료"):
+        assert any(label in entry[2] for entry in progress), label
+    assert progress[-1] == (1, 1, "완료")

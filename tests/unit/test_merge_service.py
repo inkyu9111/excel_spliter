@@ -138,6 +138,22 @@ def test_execute_publishes_only_complete_copy_and_preserves_sources(tmp_path, mo
     assert set(tmp_path.iterdir()) == {*sources, target}
 
 
+def test_execute_reports_copy_and_merge_stages_before_completion(tmp_path, monkeypatch):
+    merge, sources, target, _rows = _setup(tmp_path, monkeypatch)
+    preview = merge.MergeService().preview(sources, target)
+    monkeypatch.setattr(merge, "_write_merged", lambda temp, _preview, _progress: temp.write_bytes(b"merged"))
+    progress = []
+
+    merge.MergeService().execute(preview, overwrite=False, progress=lambda *event: progress.append(event))
+
+    assert progress == [
+        (0, 0, "원본 확인 중"),
+        (0, 0, "파일 복사 중"),
+        (0, 0, "값 병합 중"),
+        (1, 1, "완료"),
+    ]
+
+
 def test_execute_can_write_temp_when_first_source_is_read_only(tmp_path, monkeypatch):
     merge, sources, target, _rows = _setup(tmp_path, monkeypatch)
     sources[0].chmod(stat.S_IREAD)
@@ -311,7 +327,8 @@ def test_native_writer_keeps_values_order_duplicates_formats_and_first_totals(tm
     assert books[temp].saved and all(book.closed for book in books.values())
     assert books[temp].save_options == dict(FileFormat=51, Password="", WriteResPassword="", ReadOnlyRecommended=False, AddToMru=False)
     assert all(not books[path].saved for path in sources)
-    assert progress[-1] == (2, 2, "second.xlsx")
+    assert progress[:2] == [(1, 2, "first.xlsx"), (2, 2, "second.xlsx")]
+    assert progress[2:] == [(0, 0, "결과 저장 중"), (0, 0, "저장 결과 확인 중")]
 
 
 class _Header:

@@ -163,7 +163,9 @@ def test_compare_selection_creates_unused_output_and_saves_result(toolkit, monke
     assert gui.notebook.tab(0, "state") == gui.notebook.tab(1, "state") == "disabled"
     assert str(gui.compare_button["state"]) == "disabled"
     complete_worker(gui)
-    assert str(output) in messages[0] and "3" in messages[0] and "누락 시트" in messages[0]
+    summary = gui.result_panels["compare"][1]["text"]
+    assert str(output) in summary and "3" in summary and "누락 시트" in summary
+    assert messages == []
     assert gui.notebook.tab(0, "state") == gui.notebook.tab(1, "state") == "normal"
     assert str(gui.compare_button["state"]) == "normal"
 
@@ -225,7 +227,9 @@ def test_key_compare_loads_tables_selects_multiple_columns_and_sends_options(too
     monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda _, text, **__: messages.append(text))
     gui._compare()
     complete_worker(gui)
-    assert "3" in messages[0] and "old_amount" in messages[0]
+    summary = gui.result_panels["compare"][1]["text"]
+    assert "3" in summary and "old_amount" in summary
+    assert messages == []
 
 
 def test_key_compare_switching_table_or_file_clears_keys_and_position_mode_stays_available(toolkit, monkeypatch, tmp_path):
@@ -296,7 +300,8 @@ def test_etc_loads_sheets_and_saves_selected_operations_to_new_file(toolkit, mon
     assert str(gui.etc_button["state"]) == "disabled"
     complete_worker(gui)
     assert calls == [(source, "Clean", output, True, True, True, False)]
-    assert str(output) in messages[0]
+    assert str(output) in gui.result_panels["etc"][1]["text"]
+    assert messages == []
     assert all(gui.notebook.tab(index, "state") == "normal" for index in range(3))
 
 
@@ -458,6 +463,7 @@ def test_output_entries_edit_state_without_key_events(toolkit, monkeypatch, tmp_
 def test_output_entries_update_readiness_and_busy_state(toolkit, tmp_path):
     gui, _ = toolkit
     assert str(gui.source_entry["state"]) == "readonly"
+
     assert all(str(entry["state"]) == "normal" for entry in (
         gui.output_entry, gui.merge_output_entry, gui.compare_output_entry, gui.etc_output_entry,
     ))
@@ -486,3 +492,162 @@ def test_output_entries_update_readiness_and_busy_state(toolkit, tmp_path):
         gui.output_entry, gui.merge_output_entry, gui.compare_output_entry, gui.etc_output_entry,
     ))
     assert str(gui.source_entry["state"]) == "readonly"
+
+
+def test_position_mode_hides_keys_and_radio_switch_shows_them(toolkit):
+    gui, _ = toolkit
+    assert not gui.compare_key_options.winfo_manager()
+    gui.compare_key_radio.invoke()
+    assert gui.compare_by_key_var.get()
+    assert gui.compare_key_options.winfo_manager() == "grid"
+    gui.compare_position_radio.invoke()
+    assert not gui.compare_by_key_var.get()
+    assert not gui.compare_key_options.winfo_manager()
+
+
+def test_output_validation_rejects_original_existing_and_missing_parent(toolkit, tmp_path):
+    gui, _ = toolkit
+    source = tmp_path / "source.xlsx"
+    source.touch()
+    gui.compare_reference_var.set(str(source))
+    gui.compare_comparison_var.set(str(tmp_path / "other.xlsx"))
+    for target in (source, tmp_path / "missing" / "result.xlsx", tmp_path / "wrong.csv"):
+        gui.compare_output_var.set(str(target))
+        assert gui.compare_button.instate(["disabled"])
+        assert gui.compare_path_note.get()
+    gui.compare_output_var.set(str(tmp_path / "fresh.xlsx"))
+    assert not gui.compare_button.instate(["disabled"])
+
+
+def test_completion_panel_keeps_result_and_merge_handoff_preserves_reference(toolkit, tmp_path, monkeypatch):
+    gui, _ = toolkit
+    target = tmp_path / "merged.xlsx"
+    target.touch()
+    reference = str(tmp_path / "reference.xlsx")
+    gui.compare_reference_var.set(reference)
+    gui.merge_output_var.set(str(target))
+    gui._handle_ok(("merge_execute", target))
+    assert gui.result_paths["merge"] == (target,)
+    assert Path(gui.merge_output_var.get()) != target
+    gui._use_merge_for_compare()
+    assert gui.compare_reference_var.get() == reference
+    assert gui.compare_comparison_var.get() == str(target)
+    assert gui.notebook.index(gui.notebook.select()) == 2
+    opened = []
+    monkeypatch.setattr("excel_splitter.gui.os.startfile", opened.append)
+    gui._open_result("merge")
+    gui._open_result("merge", folder=True)
+    assert opened == [target, target.parent]
+
+
+def test_progress_unknown_phase_and_error_details_stay_readable(toolkit, monkeypatch):
+    gui, _ = toolkit
+    gui._set_busy(True)
+    gui._show_progress(0, 0, "파일 저장 중")
+    assert str(gui.merge_progress["mode"]) == "indeterminate"
+    assert "파일 저장 중" in gui.merge_status_var.get()
+    gui._show_progress(2, 5, "데이터 병합 중")
+    assert str(gui.merge_progress["mode"]) == "determinate"
+    assert "2/5" in gui.merge_status_var.get()
+    messages = []
+    monkeypatch.setattr("excel_splitter.gui.messagebox.showerror", lambda _, text, **__: messages.append(text))
+    raw = "COM diagnostic " * 1000
+    gui._handle_error(RuntimeError(raw))
+    assert messages == []
+    assert len(gui.error_message_var.get()) < 1000
+    assert raw in gui.error_detail
+    assert gui.error_panel.winfo_manager() == "grid"
+    assert not gui.error_text.winfo_manager()
+    assert not gui._busy
+
+
+def test_compare_details_keep_keys_and_both_coordinates_and_full_counts(toolkit, tmp_path):
+    from excel_splitter.compare_service import CompareDifference, CompareResult
+
+    gui, _ = toolkit
+    gui.notebook.select(2)
+    target = tmp_path / "result.xlsx"
+    target.touch()
+    gui.compare_by_key_var.set(True)
+    detail = CompareDifference("changed", "Data", cell="E4", key="id=A-1", column_name="amount",
+                               reference_value=10, comparison_value=20, reference_cell="B2", comparison_cell="E4")
+    result = CompareResult(target, 5, (), missing_rows=2, added_rows=3, modified_cells=1,
+                           details=(detail,), details_truncated=True, omitted_details=4)
+    gui._handle_ok(("compare_execute", result))
+    frame, label, tree, _ = gui.result_panels["compare"]
+    text = label["text"]
+    assert "값 변경 1셀" in text and "추가 3행" in text and "누락 2행" in text and "4건" in text
+    row = tree.item(tree.get_children()[0], "values")
+    assert all(value in row[1] for value in ("id=A-1", "B2", "E4"))
+    assert Path(gui.compare_output_var.get()) != target
+    assert "다음 실행" in gui.compare_path_note.get()
+
+
+def test_position_summary_counts_highlighted_added_and_removed_cells(toolkit, tmp_path):
+    from excel_splitter.compare_service import CompareResult
+
+    gui, _ = toolkit
+    gui._handle_ok(("compare_execute", CompareResult(tmp_path / "result.xlsx", changed_cells=7, missing_sheets=(), modified_cells=0)))
+    summary = gui.result_panels["compare"][1]["text"]
+    assert "7셀" in summary
+    assert "추가 0행" not in summary
+
+
+def test_error_details_include_underlying_cause(toolkit, monkeypatch):
+    from excel_splitter.errors import WorkbookValidationError
+
+    gui, _ = toolkit
+    monkeypatch.setattr("excel_splitter.gui.messagebox.showerror", lambda *_, **__: None)
+    try:
+        try:
+            raise RuntimeError("underlying COM diagnostic")
+        except RuntimeError as exc:
+            raise WorkbookValidationError("저장 실패") from exc
+    except WorkbookValidationError as exc:
+        gui._handle_error(exc)
+    assert "underlying COM diagnostic" in gui.error_detail
+    gui._copy_error()
+    assert "underlying COM diagnostic" in gui.root.clipboard_get()
+
+
+def test_split_failure_selection_never_opens_another_successful_file(toolkit, tmp_path, monkeypatch):
+    from excel_splitter.models import SplitFailure, SplitResult
+
+    gui, _ = toolkit
+    path = tmp_path / "success.xlsx"
+    gui._show_summary(SplitResult((path,), (SplitFailure("bad", "읽기 실패"),)))
+    tree = gui.result_panels["split"][2]
+    tree.selection_set(tree.get_children()[1])
+    opened = []
+    monkeypatch.setattr("excel_splitter.gui.os.startfile", opened.append)
+    gui._open_result("split")
+    assert opened == []
+    gui._open_result("split", folder=True)
+    assert opened == [tmp_path]
+    tree.selection_set(tree.get_children()[0])
+    gui._open_result("split")
+    assert opened == [tmp_path, path]
+
+
+def test_readonly_sources_show_filename_separately_from_long_path(toolkit, tmp_path):
+    gui, _ = toolkit
+    path = tmp_path / "long-parent-name" / "source-name.xlsx"
+    gui.compare_reference_var.set(str(path))
+    assert gui.source_name_labels[str(gui.compare_reference_var)]["text"] == "source-name.xlsx"
+
+
+def test_result_detail_window_shows_full_unclipped_values(toolkit, tmp_path):
+    gui, _ = toolkit
+    content = "긴 비교값 " * 150
+    gui._show_result("compare", (tmp_path / "result.xlsx",), "완료",
+                     (("값 변경", "key=1 · 기준 A1, 대상 Z999", "내용", content, "after"),))
+    tree = gui.result_panels["compare"][2]
+    tree.selection_set(tree.get_children()[0])
+    window = gui._show_result_detail("compare")
+    try:
+        text = next(widget for widget in window.winfo_children() if isinstance(widget, tk.Text))
+        assert content in text.get("1.0", "end")
+        assert "Z999" in text.get("1.0", "end")
+        assert str(text["state"]) == "disabled"
+    finally:
+        window.destroy()
