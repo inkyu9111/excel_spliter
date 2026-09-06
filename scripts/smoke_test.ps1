@@ -86,7 +86,7 @@ Write-Host "  pattern: %_결과"
 Write-Host "  A_결과.xlsx: 2 data rows; only 분류표"
 Write-Host "  _결과.xlsx: 1 data row; only 분류표"
 Write-Host "  source SHA-256 before: $SourceHash"
-Write-Host "Manual checklist: calculated column, formula, total row, conditional format, validation, merge, width/height, shape, chart, and print setting are preserved."
+Write-Host "Manual checklist: calculated column, formula, total row, conditional format, validation, merged cells, width/height, and print setting are preserved. Shapes, charts and comments on the selected sheet are removed. References to deleted sheets may break."
 Write-Host "Confirm the deleted-sheet-reference warning appears and no orphan Excel process remains."
 
 $Process = Start-Process -FilePath $ExePath -PassThru

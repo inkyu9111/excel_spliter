@@ -47,6 +47,11 @@ def _read(path):
         tables = [name for name in members if re.fullmatch(r"xl/tables/[^/]+\.xml", name)]
         if len(sheets) != 1 or len(tables) != 1 or any(name.startswith("xl/externalLinks/") for name in members):
             raise ValueError("unsupported package layout or external links")
+        sheet_xml = archive.read(sheets[0])
+        # Other encodings and entity-generated markup need the existing parser.
+        if (sheet_xml.startswith(b'<?xml version="1.0" encoding="UTF-8"')
+                and b"conditionalFormatting" not in sheet_xml and b"<!DOCTYPE" not in sheet_xml):
+            raise ValueError("not exactly one conditional-format rule")
         workbook = minidom.parseString(archive.read("xl/workbook.xml"))
         if any(node.getAttribute("name").casefold() not in {"_xlnm." + name for name in _LAYOUT_NAMES}
                for node in _elements(workbook, "definedName")):
@@ -59,7 +64,7 @@ def _read(path):
         colors = tuple(node.toxml() for node in _elements(styles, "colors"))
         themes = tuple((name, archive.read(name)) for name in sorted(members) if name.startswith("xl/theme/"))
         context = (bounds[1], bounds[2], bounds[3], themes, colors)
-        return _Package(sheets[0], minidom.parseString(archive.read(sheets[0])), styles, context)
+        return _Package(sheets[0], minidom.parseString(sheet_xml), styles, context)
 
 
 def _formats(package):

@@ -1,5 +1,6 @@
-"""Opt-in native Excel check: python scripts/check_merge_excel.py."""
+"""Opt-in native Excel check using the GUI's per-action worker lifetime."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -10,6 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from excel_splitter.excel_gateway import _excel_session, _open_workbook
 from excel_splitter.file_signature import capture_signature
 from excel_splitter.merge_service import MergeService
+
+
+def _gui_worker(action, *args, **kwargs):
+    # The GUI starts a fresh thread for each preview/execution; do the same here.
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        return worker.submit(action, *args, **kwargs).result()
 
 
 def check_full_column_rule(root: Path) -> None:
@@ -25,7 +32,7 @@ def check_full_column_rule(root: Path) -> None:
                 sheet.Range("A1:H1").Value2 = (tuple(f"Column{i}" for i in range(1, 9)),)
                 sheet.Range("A2:H3").Value2 = (tuple(range(1, 9)), tuple(range(11, 19)))
                 sheet.ListObjects.Add(1, sheet.Range("A1:H3"), None, 1).Name = "DataTable"
-                rule = sheet.Range("H:H").FormatConditions.Add(Type=2, Formula1="=$H1>0")
+                rule = sheet.Range("H:H").FormatConditions.Add(2, 3, "=$H1>0", "")
                 rule.StopIfTrue = True
                 rule.Font.Bold = True
                 rule.Font.Color = 255
@@ -34,10 +41,12 @@ def check_full_column_rule(root: Path) -> None:
                 book.SaveAs(str(source), FileFormat=51)
             finally:
                 book.Close(SaveChanges=False)
+                # Release child COM proxies before their Excel session ends.
+                book = sheet = rule = None
     before = tuple(capture_signature(source) for source in sources)
     service = MergeService()
-    output = service.execute(service.preview(sources, root / "cf-merged.xlsx"),
-                             overwrite=False, progress=lambda *_: None)
+    preview = _gui_worker(service.preview, sources, root / "cf-merged.xlsx")
+    output = _gui_worker(service.execute, preview, overwrite=False, progress=lambda *_: None)
     assert tuple(capture_signature(source) for source in sources) == before
     with _excel_session() as excel:
         book = _open_workbook(excel, output, read_only=True)
@@ -55,6 +64,7 @@ def check_full_column_rule(root: Path) -> None:
             assert book.LinkSources(1) is None
         finally:
             book.Close(SaveChanges=False)
+            book = sheet = rule = None
 
 
 def main() -> None:
@@ -100,13 +110,14 @@ def main() -> None:
                     book.SaveAs(str(source), FileFormat=51)
                 finally:
                     book.Close(SaveChanges=False)
+                    book = sheet = table = residual_style = None
         before = tuple(capture_signature(source) for source in sources)
         service = MergeService()
         started = perf_counter()
-        preview = service.preview(sources, root / "merged.xlsx")
+        preview = _gui_worker(service.preview, sources, root / "merged.xlsx")
         print(f"Preview: {perf_counter() - started:.3f}s for {len(sources)} files")
         assert preview.row_count == 5
-        output = service.execute(preview, overwrite=False, progress=lambda *_: None)
+        output = _gui_worker(service.execute, preview, overwrite=False, progress=lambda *_: None)
         assert tuple(capture_signature(source) for source in sources) == before
         with _excel_session() as excel:
             book = _open_workbook(excel, output, read_only=True)
@@ -131,6 +142,7 @@ def main() -> None:
                 assert book.LinkSources(1) is None
             finally:
                 book.Close(SaveChanges=False)
+                book = sheet = table = None
         assert set(root.rglob("*.xlsx")) == {*sources, output}
         check_full_column_rule(root)
     print("PASS: native Merge values, duplicates, formulas, formats, totals, filtered/hidden rows, styled blank expansion, outside content, unchanged inputs, and one $H:$H rule after merging 15 files")
