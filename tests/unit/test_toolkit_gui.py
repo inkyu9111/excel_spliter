@@ -35,6 +35,8 @@ def toolkit(monkeypatch, tk_root):
     )
     gui.notebook.select(1)
     yield gui, calls
+    for bar in (gui.progress, gui.merge_progress, gui.compare_progress, gui.etc_progress):
+        bar.stop()
     for pending in root.tk.call("after", "info"):
         root.after_cancel(pending)
     for child in root.winfo_children():
@@ -62,6 +64,41 @@ def add_files(gui, monkeypatch):
     monkeypatch.setattr("excel_splitter.toolkit_gui.filedialog.askopenfilenames", lambda **_: ("b.xlsx", "a.xlsx", "b.xlsx"))
     gui._add_merge_files()
     gui.merge_output_var.set(str(Path("merged.xlsx").resolve()))
+
+
+def test_window_uses_packaged_multisize_wrench_icon(toolkit):
+    import struct
+    import win32con
+    import win32gui
+    import win32ui
+    import excel_splitter.toolkit_gui as toolkit_module
+
+    gui, _ = toolkit
+    icon = Path(toolkit_module.__file__).with_name("assets") / "app.ico"
+    data = icon.read_bytes()
+    reserved, kind, count = struct.unpack_from("<HHH", data)
+    assert (reserved, kind) == (0, 1)
+    sizes = {tuple(value or 256 for value in data[6 + 16 * i:8 + 16 * i])
+             for i in range(count)}
+    assert {(size, size) for size in (16, 24, 32, 48, 64, 128, 256)} <= sizes
+    gui.root.update_idletasks()
+    window = win32gui.GetParent(gui.root.winfo_id())
+    def pixels(handle):
+        info = win32gui.GetIconInfo(handle)
+        bitmap = win32ui.CreateBitmapFromHandle(info[4])
+        dimensions = bitmap.GetInfo()
+        return dimensions["bmWidth"], dimensions["bmHeight"], bitmap.GetBitmapBits(True)
+
+    for kind in (win32con.ICON_SMALL, win32con.ICON_BIG):
+        actual = win32gui.SendMessage(window, win32con.WM_GETICON, kind, 0)
+        assert actual
+        width, height, actual_pixels = pixels(actual)
+        expected = win32gui.LoadImage(None, str(icon), win32con.IMAGE_ICON, width, height,
+                                     win32con.LR_LOADFROMFILE)
+        try:
+            assert actual_pixels == pixels(expected)[2]
+        finally:
+            win32gui.DestroyIcon(expected)
 
 
 def test_file_order_preview_and_changes_invalidate_merge(toolkit, monkeypatch):
@@ -614,6 +651,78 @@ def test_progress_unknown_phase_and_error_details_stay_readable(toolkit, monkeyp
     assert not gui._busy
 
 
+def test_unknown_progress_moves_smoothly_without_restarting_on_phase_updates(toolkit):
+    gui, _ = toolkit
+    gui._executing = True
+    gui._set_busy(True)
+    bar = gui.merge_progress
+    # Advance the real Tk animation by one frame, not a mocked progress widget.
+    before = float(bar["value"])
+    bar.step()
+    assert 0 < (float(bar["value"]) - before) / float(bar["maximum"]) <= 0.05
+    position = float(bar["value"])
+    gui._show_progress(0, 0, "다음 파일 저장 중")
+    assert float(bar["value"]) == position
+    gui._set_busy(False)
+
+
+def test_running_one_tab_does_not_animate_other_tabs(toolkit):
+    gui, _ = toolkit
+    gui._executing = True
+    gui._set_busy(True)
+    gui._show_progress(2, 5, "병합 중")
+    assert float(gui.merge_progress["value"]) == 2
+    assert [float(bar["value"]) for bar in (gui.progress, gui.compare_progress, gui.etc_progress)] == [0, 0, 0]
+    gui._set_busy(False)
+
+
+def test_worker_status_and_errors_stay_on_the_active_tab(toolkit):
+    gui, _ = toolkit
+    split_status = gui.split_status_var.get()
+    gui._executing = True
+    gui._set_busy(True)
+    gui._show_progress(1, 3, "병합 작업")
+    assert gui.split_status_var.get() == split_status
+    assert "병합 작업" in gui.merge_status_var.get()
+    gui._handle_error(PermissionError("합성 잠금"))
+    assert gui.split_status_var.get() == split_status
+
+
+@pytest.mark.parametrize("tab", range(4))
+@pytest.mark.parametrize("known_total", [False, True])
+def test_real_worker_error_stops_animation_and_next_run_recovers(toolkit, tab, known_total):
+    gui, _ = toolkit
+    gui.notebook.select(tab)
+
+    def fail_midway():
+        gui.events.put(("progress", 2 if known_total else 0, 5 if known_total else 0, "중간 처리"))
+        raise PermissionError("합성 파일 잠금 오류")
+
+    gui._start_worker(fail_midway, execution=True)
+    event = gui.events.get(timeout=3)
+    gui._show_progress(*event[1:])
+    event = gui.events.get(timeout=3)
+    assert event[0] == "error"
+    gui._handle_error(event[1])
+    bar = gui._progress_widget()
+    assert not gui._busy and not gui._executing and not gui._progress_running
+    assert str(bar["mode"]) == "determinate" and float(bar["value"]) == 0
+    done = tk.BooleanVar(value=False)
+    gui.root.after(120, lambda: done.set(True))
+    gui.root.wait_variable(done)
+    assert float(bar["value"]) == 0
+    assert all(gui.notebook.tab(index, "state") == "normal" for index in range(4))
+    gui._show_progress(5, 5, "뒤늦은 알림")
+    assert float(bar["value"]) == 0
+
+    gui._start_worker(lambda: ("noop", None), execution=True)
+    assert gui.events.get(timeout=3) == ("ok", ("noop", None))
+    assert str(bar["mode"]) == "indeterminate"
+    gui._show_progress(1, 1, "완료")
+    gui._handle_ok(("noop", None))
+    assert float(bar["value"]) == 1 and not gui._progress_running
+
+
 def test_compare_details_keep_keys_and_both_coordinates_and_full_counts(toolkit, tmp_path):
     from excel_splitter.compare_service import CompareDifference, CompareResult
 
@@ -687,6 +796,73 @@ def test_readonly_sources_show_filename_separately_from_long_path(toolkit, tmp_p
     path = tmp_path / "long-parent-name" / "source-name.xlsx"
     gui.compare_reference_var.set(str(path))
     assert gui.source_name_labels[str(gui.compare_reference_var)]["text"] == "source-name.xlsx"
+
+
+def _widgets(parent):
+    for child in parent.winfo_children():
+        yield child
+        yield from _widgets(child)
+
+
+def test_default_window_is_compact(toolkit):
+    gui, _ = toolkit
+    gui.root.deiconify()
+    gui.root.update()
+    try:
+        assert gui.root.winfo_width() <= 960
+        assert gui.root.winfo_height() <= 720
+    finally:
+        gui.root.withdraw()
+
+
+def test_long_paths_are_wrapped_in_full_without_squeezing_input_controls(toolkit, tmp_path):
+    from tkinter import ttk
+
+    gui, _ = toolkit
+    path = str(tmp_path / ("한글 경로 " * 6) / ("긴 합성 파일명 " * 5 + ".xlsx"))
+    gui.compare_reference_var.set(path)
+    gui.compare_comparison_var.set(path)
+    gui.notebook.select(2)
+    gui.root.geometry("900x680")
+    gui.root.deiconify()
+    gui.root.update()
+    try:
+        labels = [widget for widget in _widgets(gui.root) if isinstance(widget, ttk.Label)
+                  and str(widget.cget("textvariable")) == str(gui.compare_reference_var)]
+        assert labels, "Long paths need a full wrapped display beside the scrollable entry"
+        label = labels[0]
+        assert label.winfo_manager() == "grid"
+        assert gui.root.getvar(str(label.cget("textvariable"))) == path
+        assert float(label.cget("wraplength")) <= label.winfo_width()
+        entries = [widget for widget in _widgets(gui.root) if isinstance(widget, ttk.Entry)
+                   and str(widget.cget("textvariable")) == str(gui.compare_reference_var)]
+        assert entries[0].winfo_width() >= 200
+        assert entries[0].winfo_rootx() + entries[0].winfo_width() < gui.root.winfo_rootx() + gui.root.winfo_width()
+    finally:
+        gui.root.withdraw()
+
+
+def test_merge_selection_exposes_full_path_in_compact_window(toolkit, tmp_path):
+    from tkinter import ttk
+
+    gui, _ = toolkit
+    paths = [tmp_path / ("한글 폴더 " * 8) / f"합성 파일 {index}.xlsx" for index in range(2)]
+    gui.merge_sources = paths
+    gui._invalidate_merge_preview()
+    gui.merge_tree.selection_set("1")
+    gui.merge_tree.event_generate("<<TreeviewSelect>>")
+    gui.root.geometry("900x680")
+    gui.root.deiconify()
+    gui.root.update()
+    try:
+        labels = [widget for widget in _widgets(gui.root) if isinstance(widget, ttk.Label)
+                  and widget.cget("textvariable")
+                  and gui.root.getvar(str(widget.cget("textvariable"))) == str(paths[1])]
+        assert labels, "The selected merge input must be readable without truncation"
+        assert float(labels[0].cget("wraplength")) <= labels[0].winfo_width()
+        assert gui.merge_tree.cget("xscrollcommand")
+    finally:
+        gui.root.withdraw()
 
 
 def test_result_detail_window_shows_full_unclipped_values(toolkit, tmp_path):

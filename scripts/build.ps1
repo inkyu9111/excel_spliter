@@ -8,8 +8,10 @@ Set-Location $ProjectRoot
 
 $ProjectMarker = Join-Path $ProjectRoot "pyproject.toml"
 $EntryPoint = Join-Path $ProjectRoot "src\excel_splitter\__main__.py"
+$AppIcon = Join-Path $ProjectRoot "src\excel_splitter\assets\app.ico"
 if (-not (Test-Path -LiteralPath $ProjectMarker -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $EntryPoint -PathType Leaf)) {
+    -not (Test-Path -LiteralPath $EntryPoint -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $AppIcon -PathType Leaf)) {
     throw "Could not validate the Excel File Toolkit project root: $ProjectRoot"
 }
 
@@ -43,6 +45,7 @@ $PythonComBinary = "$PythonComDll;pywin32_system32"
 Invoke-Checked {
     & $PythonExe -m PyInstaller --noconfirm --clean --onedir --windowed `
         --name ExcelFileToolkit --paths src --add-binary $PythonComBinary `
+        --icon $AppIcon --add-data "$AppIcon;excel_splitter/assets" `
         --workpath build\toolkit-onedir --distpath build\toolkit-preview `
         src/excel_splitter/__main__.py
 } "One-folder build"
@@ -70,6 +73,7 @@ if (-not $Probe.WaitForExit(3000)) {
 Invoke-Checked {
     & $PythonExe -m PyInstaller --noconfirm --clean --onefile --windowed `
         --name ExcelFileToolkit --paths src --add-binary $PythonComBinary `
+        --icon $AppIcon --add-data "$AppIcon;excel_splitter/assets" `
         src/excel_splitter/__main__.py
 } "One-file build"
 
@@ -85,6 +89,9 @@ if ($LASTEXITCODE -ne 0) {
 if (-not ($ArchiveListing -match 'pywin32_system32[\\/]pythoncom\d+\.dll')) {
     throw "Final executable omitted the pythoncom native DLL."
 }
+if (-not ($ArchiveListing -match 'excel_splitter[\\/]assets[\\/]app\.ico')) {
+    throw "Final executable omitted the window icon."
+}
 $SelfTest = Start-Process -FilePath $FinalExe `
     -ArgumentList "--self-test-pywin32" -WindowStyle Hidden -PassThru
 if (-not $SelfTest.WaitForExit(30000)) {
@@ -94,4 +101,7 @@ if (-not $SelfTest.WaitForExit(30000)) {
 if ($SelfTest.ExitCode -ne 0) {
     throw "Final executable could not import pythoncom/win32com (exit $($SelfTest.ExitCode))."
 }
+Invoke-Checked {
+    & $PythonExe scripts/check_executable_icon.py $OnedirExe $FinalExe
+} "Executable and window icon verification"
 Write-Host "Built: $FinalExe"

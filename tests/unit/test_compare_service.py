@@ -50,10 +50,13 @@ def test_rejects_unsafe_output_before_excel(tmp_path, monkeypatch, target_kind):
         target.write_bytes(b"prior output")
     elif target_kind == "hardlink":
         target.hardlink_to(comparison)
-    elif target_kind == "symlink":
-        target.symlink_to(comparison)
-    elif target_kind == "dangling_symlink":
-        target.symlink_to(tmp_path / "missing.xlsx")
+    elif target_kind in ("symlink", "dangling_symlink"):
+        try:
+            target.symlink_to(comparison if target_kind == "symlink" else tmp_path / "missing.xlsx")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows does not grant symbolic-link creation permission")
+            raise
     elif target_kind == "directory":
         target.mkdir()
     elif target_kind == "extension":

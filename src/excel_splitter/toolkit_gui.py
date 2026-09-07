@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from .compare_service import CompareService
 from .controller import AppController
@@ -28,6 +28,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_sources: list[Path] = []
         self.merge_preview: MergePreview | None = None
         self.source_name_labels = {}
+        self._progress_variables = []
         super().__init__(root, controller)
         self.merge_output_var.trace_add("write", self._merge_output_changed)
         self.compare_output_var.trace_add("write", self._compare_output_changed)
@@ -38,7 +39,8 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
 
     def _build(self) -> None:
         self.root.title("Excel File Toolkit")
-        self.root.geometry("1024x800")
+        self.root.iconbitmap(str(Path(__file__).with_name("assets") / "app.ico"))
+        self.root.geometry("900x680")
         self.root.minsize(740, 520)
         self.root.option_add("*Font", ("맑은 고딕", 10))
         style = ttk.Style(self.root)
@@ -47,9 +49,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         style.configure("TFrame", background="#ffffff")
         style.configure("TFrame", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3")
         style.configure("TLabel", background="#ffffff")
-        style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=5)
+        style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=3)
         style.map("TEntry", fieldbackground=[("readonly", "#f7f9fa")])
-        style.configure("TCombobox", fieldbackground="#ffffff", background="#f7f9fa", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=5)
+        style.configure("TCombobox", fieldbackground="#ffffff", background="#f7f9fa", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=3)
         style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")])
         style.configure("Horizontal.TProgressbar", troughcolor="#eef2f1", background="#18754c", bordercolor="#eef2f1", lightcolor="#18754c", darkcolor="#18754c")
         style.configure("TButton", padding=(8, 4), background="#ffffff")
@@ -60,11 +62,11 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         style.configure("TNotebook.Tab", padding=(16, 6))
         style.map("TNotebook.Tab", padding=[("selected", (16, 6)), ("!selected", (16, 6))],
                   background=[("selected", "#edf5f0")], foreground=[("selected", "#18754c")])
-        style.configure("Treeview", rowheight=30, fieldbackground="#ffffff", bordercolor="#d5dde3")
-        style.configure("Treeview.Heading", padding=8, background="#f3f6f8")
-        style.configure("Section.TLabel", font=("맑은 고딕", 12, "bold"))
+        style.configure("Treeview", rowheight=26, fieldbackground="#ffffff", bordercolor="#d5dde3")
+        style.configure("Treeview.Heading", padding=5, background="#f3f6f8")
+        style.configure("Section.TLabel", font=("맑은 고딕", 11, "bold"))
         style.configure("Note.TLabel", foreground="#64788a")
-        header = ttk.Frame(self.root, padding=(20, 14))
+        header = ttk.Frame(self.root, padding=(16, 10))
         header.grid(row=0, column=0, sticky="ew")
         ttk.Label(header, text="Excel File Toolkit", font=("맑은 고딕", 15, "bold")).pack(side="left")
         ttk.Label(header, text="원본은 그대로, 결과는 새 파일로", style="Note.TLabel").pack(side="right")
@@ -90,7 +92,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         bar.grid(row=0, column=1, sticky="ns")
         canvas.configure(yscrollcommand=bar.set)
-        page = ttk.Frame(canvas, padding=(8, 12, 12, 20))
+        page = ttk.Frame(canvas, padding=(8, 8, 12, 12))
         window = canvas.create_window(0, 0, window=page, anchor="nw")
         page.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
@@ -105,29 +107,48 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
 
     def _section(self, page, row: int, title: str):
         section = ttk.Frame(page)
-        section.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        section.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         section.columnconfigure(0, weight=1)
-        ttk.Label(section, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(4, 8))
+        ttk.Label(section, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(2, 5))
         body = ttk.Frame(section)
         body.grid(row=1, column=0, sticky="ew")
         body.columnconfigure(0, weight=1)
         return body
 
+    def _wrapped_label(self, parent, **options):
+        label = ttk.Label(parent, width=1, justify="left", **options)
+        label.bind("<Configure>", lambda event: label.configure(wraplength=max(1, event.width)))
+        return label
+
     def _path_row(self, parent, variable, action, label="", readonly=False):
         row = ttk.Frame(parent)
         row.grid(sticky="ew", pady=4)
         row.columnconfigure(0, weight=1)
+        caption = ttk.Frame(row)
+        caption.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 3))
+        caption.columnconfigure(1, weight=1)
         if label:
-            ttk.Label(row, text=label).grid(row=0, column=0, sticky="w", pady=(0, 5))
+            ttk.Label(caption, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8))
         if readonly:
-            name = ttk.Label(row, font=("맑은 고딕", 10, "bold"))
-            name.grid(row=0, column=1, columnspan=2, sticky="e")
+            name = self._wrapped_label(caption, font=("맑은 고딕", 10, "bold"), anchor="e")
+            name.grid(row=0, column=1, sticky="ew")
             self.source_name_labels[str(variable)] = name
             variable.trace_add("write", lambda *_: name.configure(text=Path(variable.get()).name if variable.get() else ""))
         entry = ttk.Entry(row, textvariable=variable, state="readonly" if readonly else "normal")
-        entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=5)
+        entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=2)
         button = ttk.Button(row, text="찾아보기", command=action)
         button.grid(row=1, column=2)
+        full_path = self._wrapped_label(row, textvariable=variable, style="Note.TLabel")
+        path_font = tkfont.Font(root=self.root, font=entry.cget("font"))
+
+        def show_full_path(*_):
+            if variable.get() and path_font.measure(variable.get()) > entry.winfo_width() - 12:
+                full_path.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+            else:
+                full_path.grid_remove()
+
+        variable.trace_add("write", show_full_path)
+        entry.bind("<Configure>", show_full_path)
         self._input_widgets.append(button)
         if not readonly:
             self._input_widgets.append(entry)
@@ -141,7 +162,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._input_widgets.append(recommend)
         note = tk.StringVar()
         setattr(self, kind + "_path_note", note)
-        ttk.Label(body, textvariable=note, style="Note.TLabel", wraplength=850).grid(sticky="w", pady=(4, 0))
+        self._wrapped_label(body, textvariable=note, style="Note.TLabel").grid(sticky="ew", pady=(4, 0))
         setattr(self, kind + "_output_entry", entry)
 
     def _work_footer(self, page, kind, text, action, preview_action=None):
@@ -152,11 +173,13 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         reason = tk.StringVar()
         setattr(self, kind + "_status_var", status)
         setattr(self, kind + "_reason_var", reason)
-        progress = ttk.Progressbar(footer, variable=self.progress_var, maximum=1)
+        variable = tk.DoubleVar(value=0)
+        self._progress_variables.append(variable)
+        progress = ttk.Progressbar(footer, variable=variable, maximum=1)
         progress.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         setattr(self, kind + "_progress", progress)
-        ttk.Label(footer, textvariable=status, style="Note.TLabel", wraplength=650).grid(row=1, column=0, sticky="w")
-        ttk.Label(footer, textvariable=reason, style="Note.TLabel", wraplength=650).grid(row=2, column=0, sticky="w")
+        self._wrapped_label(footer, textvariable=status, style="Note.TLabel").grid(row=1, column=0, sticky="ew")
+        self._wrapped_label(footer, textvariable=reason, style="Note.TLabel").grid(row=2, column=0, sticky="ew")
         if preview_action:
             preview = ttk.Button(footer, text="미리보기", command=preview_action)
             preview.grid(row=1, column=1, rowspan=2, padx=8)
@@ -172,8 +195,8 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         frame = ttk.Frame(page, padding=12, relief="solid", borderwidth=1)
         frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         frame.columnconfigure(0, weight=1)
-        label = ttk.Label(frame, wraplength=850, font=("맑은 고딕", 10, "bold"))
-        label.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        label = self._wrapped_label(frame, font=("맑은 고딕", 10, "bold"))
+        label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         table = ttk.Frame(frame)
         table.grid(row=1, column=0, sticky="ew")
         table.columnconfigure(0, weight=1)
@@ -228,13 +251,13 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.column_combo.bind("<<ComboboxSelected>>", self._select_column)
         ttk.Label(body, text="파일명 패턴 · %는 분류값으로 바뀝니다", style="Note.TLabel").grid(sticky="w", pady=(8, 4))
         self.pattern_entry = ttk.Entry(body, textvariable=self.pattern_var)
-        self.pattern_entry.grid(sticky="ew", ipady=4)
+        self.pattern_entry.grid(sticky="ew", ipady=2)
         self.pattern_entry.bind("<KeyRelease>", self._pattern_changed)
         self._input_widgets.extend((self.sheet_combo, self.column_combo, self.pattern_entry))
         body = self._section(page, 2, "3   저장 위치")
         self.output_entry, _ = self._path_row(body, self.output_var, self._browse_output, "출력 폴더")
         self.split_path_note = tk.StringVar()
-        ttk.Label(body, textvariable=self.split_path_note, style="Note.TLabel", wraplength=850).grid(sticky="w")
+        self._wrapped_label(body, textvariable=self.split_path_note, style="Note.TLabel").grid(sticky="ew")
         preview_frame = ttk.Frame(body)
         preview_frame.grid(sticky="ew", pady=(10, 0))
         preview_frame.columnconfigure(0, weight=1)
@@ -261,9 +284,16 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_tree.grid(row=0, column=0, sticky="ew")
         bar = ttk.Scrollbar(body, orient="vertical", command=self.merge_tree.yview)
         bar.grid(row=0, column=1, sticky="ns")
-        self.merge_tree.configure(yscrollcommand=bar.set)
+        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.merge_tree.xview)
+        hbar.grid(row=1, column=0, sticky="ew")
+        self.merge_tree.configure(yscrollcommand=bar.set, xscrollcommand=hbar.set)
+        self.merge_selected_path_var = tk.StringVar()
+        self._wrapped_label(body, textvariable=self.merge_selected_path_var, style="Note.TLabel").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        self.merge_tree.bind("<<TreeviewSelect>>", lambda _: self.merge_selected_path_var.set(
+            str(self.merge_sources[int(self.merge_tree.selection()[0])]) if self.merge_tree.selection() else ""))
         actions = ttk.Frame(body)
-        actions.grid(row=1, column=0, sticky="w", pady=8)
+        actions.grid(row=3, column=0, sticky="w", pady=6)
         for i, (label, action) in enumerate((("파일 추가", self._add_merge_files), ("선택 제거", self._remove_merge_file),
                                             ("위로", lambda: self._move_merge_file(-1)), ("아래로", lambda: self._move_merge_file(1)))):
             button = ttk.Button(actions, text=label, command=action)
@@ -313,7 +343,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.error_panel.grid(row=2, column=0, sticky="ew")
         self.error_panel.columnconfigure(0, weight=1)
         self.error_message_var = tk.StringVar()
-        ttk.Label(self.error_panel, textvariable=self.error_message_var, foreground="#a3372b", wraplength=850).grid(row=0, column=0, sticky="w")
+        self._wrapped_label(self.error_panel, textvariable=self.error_message_var, foreground="#a3372b").grid(row=0, column=0, sticky="ew")
         actions = ttk.Frame(self.error_panel)
         actions.grid(row=1, column=0, sticky="w", pady=6)
         for i, (label, action) in enumerate((("상세 내용", self._toggle_error_detail), ("오류 복사", self._copy_error),
@@ -583,6 +613,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_tree.delete(*self.merge_tree.get_children())
         for index, path in enumerate(self.merge_sources):
             self.merge_tree.insert("", "end", iid=str(index), values=(str(path), "", ""))
+        if self.merge_sources:
+            self.merge_tree.selection_set("0")
+        self.merge_selected_path_var.set(str(self.merge_sources[0]) if self.merge_sources else "")
         self.merge_status_var.set(f"파일 {len(self.merge_sources)}개 · 순서를 확인하고 미리보기를 누르세요.")
         self._render_merge_state()
 
@@ -649,6 +682,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         )), execution=True)
 
     def _set_busy(self, busy: bool) -> None:
+        index = self.notebook.index(self.notebook.select())
+        self.progress_var = self._progress_variables[index]
+        self.status_var = (self.split_status_var, self.merge_status_var, self.compare_status_var, self.etc_status_var)[index]
         super()._set_busy(busy)
         selected = self.notebook.select()
         for tab in self.notebook.tabs():
@@ -743,9 +779,3 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         return (self.progress, self.merge_progress, self.compare_progress, self.etc_progress)[
             self.notebook.index(self.notebook.select())
         ]
-
-    def _update_elapsed(self) -> None:
-        super()._update_elapsed()
-        selected = self.notebook.index(self.notebook.select())
-        status = (self.status_var, self.merge_status_var, self.compare_status_var, self.etc_status_var)[selected]
-        status.set(self.status_var.get())

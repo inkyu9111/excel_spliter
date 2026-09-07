@@ -10,9 +10,9 @@ STYLE = '<dxf><font><b/><color rgb="FFFF0000"/></font><fill><patternFill pattern
 
 
 def _package(path, *, rule=RULE, scope="H1:H1048576", table="B5:H7", style=STYLE,
-             extra="", names="", theme=b"same theme"):
+             extra="", names="", theme=b"same theme", sheet_xml=None):
     with ZipFile(path, "w") as archive:
-        archive.writestr("xl/worksheets/sheet1.xml", f'<worksheet xmlns="{NS}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:xr="urn:test-revision" mc:Ignorable="xr"><sheetData><row r="6"><c r="H6"><v>7</v></c></row></sheetData><conditionalFormatting sqref="{scope}">{rule}</conditionalFormatting>{extra}<tableParts count="1"/></worksheet>')
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml if sheet_xml is not None else f'<worksheet xmlns="{NS}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:xr="urn:test-revision" mc:Ignorable="xr"><sheetData><row r="6"><c r="H6"><v>7</v></c></row></sheetData><conditionalFormatting sqref="{scope}">{rule}</conditionalFormatting>{extra}<tableParts count="1"/></worksheet>')
         archive.writestr("xl/styles.xml", f'<styleSheet xmlns="{NS}"><dxfs count="1">{style}</dxfs><colors><indexedColors><rgbColor rgb="FF000000"/></indexedColors></colors></styleSheet>')
         archive.writestr("xl/tables/table1.xml", f'<table xmlns="{NS}" ref="{table}"/>')
         archive.writestr("xl/workbook.xml", f'<workbook xmlns="{NS}">{names}</workbook>')
@@ -127,3 +127,77 @@ def test_external_formula_in_color_scale_threshold_is_not_restored(tmp_path):
     before = output.read_bytes()
     assert not cf.restore_full_column_rule(sources, output)
     assert output.read_bytes() == before
+
+
+def test_large_utf8_sheet_without_rules_skips_dom_and_unneeded_package_reads(tmp_path, monkeypatch):
+    from excel_splitter import merge_conditional_formats as cf
+
+    data = '<row><c><v>7</v></c></row>' * 10000
+    sheet_xml = f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{NS}"><sheetData>{data}</sheetData></worksheet>'
+    sources = (_package(tmp_path / "a.xlsx", sheet_xml=sheet_xml), _package(tmp_path / "b.xlsx"))
+    output = _package(tmp_path / "merged.xlsx", scope="H6:H7")
+    before = {path: path.read_bytes() for path in (*sources, output)}
+    reads = []
+    original_read = ZipFile.read
+
+    def read(archive, name, *args, **kwargs):
+        reads.append(name)
+        return original_read(archive, name, *args, **kwargs)
+
+    monkeypatch.setattr(ZipFile, "read", read)
+    monkeypatch.setattr(cf.minidom, "parseString", lambda *_: pytest.fail("no-CF UTF-8 input must not build a DOM"))
+
+    assert not cf.restore_full_column_rule(sources, output)
+    assert reads == ["xl/worksheets/sheet1.xml"]
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("encoding", ["UTF-8", "UTF-16", "ISO-8859-1", "utf-8"])
+def test_full_column_rules_survive_xml_encoding_variants(tmp_path, encoding):
+    from excel_splitter import merge_conditional_formats as cf
+
+    sheet_xml = (f'<?xml version="1.0" encoding="{encoding}"?><worksheet xmlns="{NS}">'
+                 f'<conditionalFormatting sqref="H1:H1048576">{RULE}</conditionalFormatting></worksheet>').encode(encoding)
+    sources = tuple(_package(tmp_path / f"part{index}.xlsx", sheet_xml=sheet_xml) for index in range(2))
+    output = _package(tmp_path / "merged.xlsx", scope="H6:H7")
+    before = {path: path.read_bytes() for path in sources}
+
+    assert cf.restore_full_column_rule(sources, output)
+    sheet = minidom.parseString(_parts(output)["xl/worksheets/sheet1.xml"])
+    assert sheet.getElementsByTagNameNS(NS, "conditionalFormatting")[0].getAttribute("sqref") == "H1:H1048576"
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("encoding", ["UTF-16", "ISO-8859-1", "utf-8"])
+def test_no_rule_with_other_encoding_keeps_existing_parser(tmp_path, monkeypatch, encoding):
+    from excel_splitter import merge_conditional_formats as cf
+
+    sheet_xml = f'<?xml version="1.0" encoding="{encoding}"?><worksheet xmlns="{NS}"/>'.encode(encoding)
+    source = _package(tmp_path / "input.xlsx", sheet_xml=sheet_xml)
+    parsed = []
+    parse = cf.minidom.parseString
+
+    def record(data):
+        parsed.append(data)
+        return parse(data)
+
+    monkeypatch.setattr(cf.minidom, "parseString", record)
+    package = cf._read(source)
+    assert sheet_xml in parsed
+    assert package.sheet.documentElement.localName == "worksheet"
+
+
+def test_utf8_entity_generated_rule_is_not_mistaken_for_no_rule(tmp_path):
+    from excel_splitter import merge_conditional_formats as cf
+
+    rule_xml = f'<conditionalFormatting sqref="H1:H1048576">{RULE}</conditionalFormatting>'
+    encoded_rule = ''.join(f"&#{ord(character)};" for character in rule_xml)
+    sheet_xml = (f'<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE worksheet [<!ENTITY rule "{encoded_rule}">]>'
+                 f'<worksheet xmlns="{NS}">&rule;</worksheet>')
+    assert "conditionalFormatting" not in sheet_xml
+    sources = tuple(_package(tmp_path / f"part{index}.xlsx", sheet_xml=sheet_xml) for index in range(2))
+    output = _package(tmp_path / "merged.xlsx", scope="H6:H7")
+
+    assert cf.restore_full_column_rule(sources, output)
+    sheet = minidom.parseString(_parts(output)["xl/worksheets/sheet1.xml"])
+    assert sheet.getElementsByTagNameNS(NS, "conditionalFormatting")[0].getAttribute("sqref") == "H1:H1048576"

@@ -370,14 +370,16 @@ class ExcelSplitterGui:
         if self._progress_mode != mode:
             progress.configure(mode=mode)
             self._progress_mode = mode
-        progress.configure(maximum=max(total, 1))
+            self.progress_var.set(0)
+        progress.configure(maximum=total if total > 0 else 100)
         if total <= 0 and not self._progress_running:
-            progress.start(15)
+            progress.start(50)
             self._progress_running = True
         elif total > 0 and self._progress_running:
             progress.stop()
             self._progress_running = False
-        self.progress_var.set(completed)
+        if total > 0:
+            self.progress_var.set(completed)
         self._update_elapsed()
 
     def _update_elapsed(self) -> None:

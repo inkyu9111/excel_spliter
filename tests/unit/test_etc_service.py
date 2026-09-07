@@ -162,10 +162,13 @@ def test_rejection_preserves_original_and_existing_output(tmp_path, monkeypatch,
         target.write_bytes(b"prior")
     elif invalid == "hardlink":
         target.hardlink_to(source)
-    elif invalid == "symlink":
-        target.symlink_to(source)
-    elif invalid == "dangling_symlink":
-        target.symlink_to(tmp_path / "missing.xlsx")
+    elif invalid in ("symlink", "dangling_symlink"):
+        try:
+            target.symlink_to(source if invalid == "symlink" else tmp_path / "missing.xlsx")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows does not grant symbolic-link creation permission")
+            raise
     before = set(tmp_path.iterdir())
     with pytest.raises(WorkbookValidationError):
         etc.EtcService().execute(source, sheet_name, target, remove_artifacts=invalid != "noop", reset_fill=invalid != "noop", progress=lambda *_: None)
