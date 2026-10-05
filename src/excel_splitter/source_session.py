@@ -11,6 +11,7 @@ from typing import Any, Callable, ContextManager, TypeVar
 from .errors import SplitExecutionError, WorkbookValidationError
 from .excel_artifacts import delete_removable_artifacts, has_removable_artifacts
 from .excel_gateway import (
+    _clear_table_filter,
     _close_without_saving,
     _column_index,
     _excel_session,
@@ -101,6 +102,7 @@ class SourceSession:
         self._started = False
         self._shutdown = False
         self._startup: Future[None] | None = None
+        self._worker_error: BaseException | None = None
 
         self._excel: Any = None
         self._workbook: Any = None
@@ -114,6 +116,7 @@ class SourceSession:
                 startup = self._startup
             else:
                 self._started = True
+                self._worker_error = None
                 startup = Future()
                 self._startup = startup
                 self._thread = threading.Thread(
@@ -149,12 +152,15 @@ class SourceSession:
             if self._shutdown:
                 return
             self._shutdown = True
-            if not self._started:
-                return
-            self._requests.put(_STOP)
+            if self._started:
+                self._requests.put(_STOP)
             thread = self._thread
-        assert thread is not None
-        thread.join()
+        if thread is not None:
+            thread.join()
+        if self._worker_error is not None:
+            raise SplitExecutionError(
+                f"Excel 원본 세션을 종료하지 못했습니다: {self._worker_error}"
+            ) from self._worker_error
 
     def _call(self, operation: Callable[..., _Result], *args: object) -> _Result:
         with self._state_lock:
@@ -168,10 +174,12 @@ class SourceSession:
 
     def _worker_main(self) -> None:
         assert self._startup is not None
+        startup = self._startup
+        failure: BaseException | None = None
         try:
             with self._session_factory() as excel:
                 self._excel = excel
-                self._startup.set_result(None)
+                startup.set_result(None)
                 while True:
                     request = self._requests.get()
                     if request is _STOP:
@@ -185,10 +193,27 @@ class SourceSession:
                         future.set_exception(exc)
                 self._close_source()
         except BaseException as exc:
-            if not self._startup.done():
-                self._startup.set_exception(exc)
+            failure = exc
         finally:
             self._excel = None
+            self._workbook = None
+            self._handle = None
+            # Publish the stopped state before waking startup callers. A failed
+            # prewarm must allow the next real action to start a fresh session.
+            with self._state_lock:
+                self._started = False
+                self._worker_error = failure if startup.done() else None
+                while True:
+                    try:
+                        pending = self._requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    if pending is not _STOP:
+                        future = pending[2]
+                        if not future.done():
+                            future.set_exception(failure or RuntimeError("Excel 원본 세션이 종료되었습니다."))
+            if not startup.done():
+                startup.set_exception(failure or RuntimeError("Excel 원본 세션을 시작하지 못했습니다."))
 
     def _open_source(self, source: Path) -> SourceHandleInfo:
         signature = capture_signature(source)
@@ -272,7 +297,7 @@ class SourceSession:
     ) -> Path:
         handle = self._ensure_source_unchanged(for_save=True)
         if snapshot.source != handle.source or snapshot.signature != handle.signature:
-            raise SplitExecutionError("미리보기와 열린 원본이 일치하지 않습니다.")
+            raise SplitExecutionError("사전 검사한 원본과 열린 원본이 일치하지 않습니다. 파일을 다시 선택하세요.")
         if not run_dir.is_dir():
             raise SplitExecutionError("master 실행 폴더가 존재하지 않습니다.")
         master = run_dir / "m.xlsx"
@@ -299,9 +324,11 @@ class SourceSession:
                 raise SplitExecutionError(
                     "SaveAs 후 열린 통합문서가 master 경로와 일치하지 않습니다."
                 )
+            sheet, table = _shallow_validated_table(self._workbook, snapshot.sheet_name)
+            filtered = _clear_table_filter(table)
             if snapshot.has_removable_artifacts:
-                sheet = _worksheet(self._workbook, snapshot.sheet_name)
                 delete_removable_artifacts(sheet)
+            if filtered or snapshot.has_removable_artifacts:
                 self._workbook.Save()
             # Validate that in-memory copy first, then release it before the
             # required reopen check; Excel may reject opening the same path

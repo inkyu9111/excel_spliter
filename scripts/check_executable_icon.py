@@ -65,7 +65,7 @@ def check_window(executable: Path) -> None:
             win32gui.EnumWindows(
                 lambda hwnd, _: windows.append(hwnd)
                 if win32process.GetWindowThreadProcessId(hwnd)[1] in pids
-                and win32gui.GetWindowText(hwnd) == "Excel File Toolkit" else None, None)
+                and win32gui.GetWindowText(hwnd).startswith("Excel File Toolkit") else None, None)
             if windows:
                 break
             assert process.poll() is None, "EXE exited before creating its window"

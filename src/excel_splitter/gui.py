@@ -80,6 +80,7 @@ class ExcelSplitterGui:
         self._executing = False
         self._progress_mode: str | None = None
         self._progress_running = False
+        self._execute_after_preview = False
         self.result_paths = {}
         self.result_panels = {}
 
@@ -94,6 +95,8 @@ class ExcelSplitterGui:
         self._build()
         self._render_state(controller.state)
         self.output_var.trace_add("write", self._output_changed)
+        self.pattern_var.trace_add("write", self._pattern_changed)
+        self.root.report_callback_exception = self._report_callback_exception
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(75, self.poll_queue)
 
@@ -131,7 +134,6 @@ class ExcelSplitterGui:
         ttk.Label(frame, text="파일명 패턴").grid(row=3, column=0, sticky="w", pady=3)
         self.pattern_entry = ttk.Entry(frame, textvariable=self.pattern_var)
         self.pattern_entry.grid(row=3, column=1, sticky="ew", padx=6)
-        self.pattern_entry.bind("<KeyRelease>", self._pattern_changed)
 
         ttk.Label(frame, text="출력 폴더").grid(row=4, column=0, sticky="w", pady=3)
         self.output_entry = ttk.Entry(frame, textvariable=self.output_var)
@@ -161,10 +163,8 @@ class ExcelSplitterGui:
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=8, column=0, columnspan=3, sticky="e", pady=(8, 0))
-        self.preview_button = ttk.Button(buttons, text="미리보기", command=self._preview)
-        self.preview_button.grid(row=0, column=0, padx=4)
-        self.split_button = ttk.Button(buttons, text="분할", command=self._split)
-        self.split_button.grid(row=0, column=1)
+        self.split_button = ttk.Button(buttons, text="분할 시작", command=self._split)
+        self.split_button.grid(row=0, column=0)
 
         self._input_widgets.extend(
             [
@@ -174,7 +174,6 @@ class ExcelSplitterGui:
                 self.pattern_entry,
                 self.output_entry,
                 output_button,
-                self.preview_button,
                 self.split_button,
             ]
         )
@@ -187,7 +186,9 @@ class ExcelSplitterGui:
         )
         if not selected:
             return
+        self._reset_office_prefix()
         self.source_var.set(selected)
+        self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
         self._start_worker(
             lambda: ("source", self.controller.select_source(Path(selected)))
@@ -195,15 +196,33 @@ class ExcelSplitterGui:
 
     def _select_sheet(self, _event: object = None) -> None:
         name = self.sheet_var.get()
+        self._reset_office_prefix()
+        self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
         self._start_worker(lambda: ("sheet", self.controller.select_sheet(name)))
 
     def _select_column(self, _event: object = None) -> None:
-        self.controller.select_column(self.column_var.get())
+        if self._busy:
+            return
+        name = self.column_var.get()
+        self._reset_office_prefix()
+        self._clear_preview()
+        self._start_worker(lambda: ("column", self.controller.select_column(name)))
+        self._phase = "분류값과 사업소 목록 확인 중"
+
+    def _reset_office_prefix(self) -> None:
+        if hasattr(self, "split_office_prefix_var"):
+            self.split_office_prefix_var.set(False)
+            self.split_office_prefix_checkbox.configure(state="disabled")
+
+    def _office_prefix_changed(self) -> None:
+        self.controller.set_office_prefix(self.split_office_prefix_var.get())
         self._clear_preview()
         self._render_state(self.controller.state)
 
-    def _pattern_changed(self, _event: object = None) -> None:
+    def _pattern_changed(self, *_event: object) -> None:
+        if self.pattern_var.get() == self.controller.state.pattern:
+            return
         self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
         self._render_state(self.controller.state)
@@ -225,7 +244,8 @@ class ExcelSplitterGui:
         self._clear_preview()
         self._render_state(self.controller.state)
 
-    def _preview(self) -> None:
+    def _preview(self, *, execute_after: bool = False) -> None:
+        self._execute_after_preview = execute_after
         self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
         output_dir = self.controller.state.output_dir
@@ -234,6 +254,8 @@ class ExcelSplitterGui:
                 if not output_dir.exists():
                     prompt = f"폴더가 존재하지 않습니다. 만드시겠습니까?\n\n{output_dir}"
                     if not messagebox.askyesno("폴더 생성", prompt, parent=self.root):
+                        self._execute_after_preview = False
+                        self._render_state(self.controller.state)
                         return
                     output_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -244,8 +266,14 @@ class ExcelSplitterGui:
                 )
                 return
         self._start_worker(lambda: ("preview", self.controller.create_preview()))
+        self._phase = "분할 설정 확인 중"
 
     def _split(self) -> None:
+        if self._busy:
+            return
+        self._preview(execute_after=True)
+
+    def _confirm_split(self) -> None:
         preview = self.controller.state.preview
         if preview is None:
             return
@@ -288,8 +316,9 @@ class ExcelSplitterGui:
         threading.Thread(target=run, daemon=True).start()
 
     def poll_queue(self) -> None:
+        deadline = time.monotonic() + 0.02
         try:
-            while True:
+            while time.monotonic() < deadline:
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == "progress":
@@ -300,39 +329,52 @@ class ExcelSplitterGui:
                     self._handle_error(event[1])
         except queue.Empty:
             pass
-        if self._busy:
-            self._update_elapsed()
-        self.root.after(75, self.poll_queue)
+        except Exception as exc:
+            self._handle_error(exc)
+        finally:
+            if self._busy:
+                self._update_elapsed()
+            self.root.after(75, self.poll_queue)
 
     def _handle_ok(self, payload: object) -> None:
         self._set_busy(False)
         tag, value = payload
-        if tag in {"source", "sheet"}:
+        if tag in {"source", "sheet", "column"}:
             self._clear_preview()
             self._render_state(value)
             self.status_var.set("다음 항목을 선택하세요.")
         elif tag == "preview":
             self._render_preview(value)
             self._render_state(self.controller.state)
-            self.status_var.set("미리보기가 준비되었습니다.")
+            self.status_var.set("분할 설정을 확인했습니다.")
+            if self._execute_after_preview:
+                self._execute_after_preview = False
+                self._confirm_split()
         elif tag == "execute":
             self._show_summary(value)
             self._render_state(self.controller.state)
+
     def _handle_error(self, error: object) -> None:
+        self._execute_after_preview = False
         was_executing = self._executing
         self._set_busy(False)
         exc = error if isinstance(error, Exception) else Exception(str(error))
-        self.logger.error(
-            "GUI 작업 실패",
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
+        if isinstance(exc, ParallelWriteAborted):
+            if hasattr(self, "error_panel"):
+                self._show_summary(exc.partial_result)
+        if was_executing:
+            self._reset_progress()
+        self._display_error(exc)
+        self._render_state(self.controller.state)
+        self.status_var.set("오류가 발생했습니다.")
+
+    def _display_error(self, exc: Exception) -> None:
+        self.logger.error("GUI 작업 실패", exc_info=(type(exc), exc, exc.__traceback__))
         reason, action = describe_error(exc)
         message = f"{reason}\n{action}"
         if isinstance(exc, ParallelWriteAborted):
             message += (f"\n완료 {len(exc.partial_result.succeeded)}개, "
                         f"실패 {len(exc.partial_result.failed)}개, 시작하지 못함 {len(exc.unstarted)}개")
-            if hasattr(self, "error_panel"):
-                self._show_summary(exc.partial_result)
         message += f"\n\n자세한 내용: {_log_path(self.logger)}"
         self.error_detail = "".join(traceback.format_exception(exc)) + f"\n로그: {_log_path(self.logger)}"
         if hasattr(self, "error_panel"):
@@ -343,12 +385,14 @@ class ExcelSplitterGui:
             self.error_text.configure(state="disabled")
             self.error_text.grid_remove()
             self.error_panel.grid()
-        if was_executing:
-            self._reset_progress()
         if not hasattr(self, "error_panel"):
             messagebox.showerror("오류", message, parent=self.root)
-        self._render_state(self.controller.state)
-        self.status_var.set("오류가 발생했습니다.")
+
+    def _report_callback_exception(self, _kind, error, traceback_) -> None:
+        # A UI callback failure must not unlock inputs while Excel is still writing.
+        self._display_error(error.with_traceback(traceback_))
+        if not self._busy:
+            self.status_var.set("화면 처리 오류가 발생했습니다. 상세 내용과 로그를 확인하세요.")
 
     def _reset_progress(self) -> None:
         self._progress_widget().stop()
@@ -388,6 +432,8 @@ class ExcelSplitterGui:
 
     def _render_preview(self, preview: Preview) -> None:
         self._clear_preview()
+        if hasattr(self, "split_path_note"):
+            self.preview_tree.master.grid()
         counts = {group.key: group.count for group in preview.snapshot.groups}
         for target in preview.targets:
             label = target.label if target.label else "∅ (빈 셀)"
@@ -403,7 +449,7 @@ class ExcelSplitterGui:
                               f"분할 완료 · 성공 {len(result.succeeded)}개 · 실패 {len(result.failed)}개", rows)
             self._clear_preview()
             self.controller.set_pattern(self.pattern_var.get())
-            self.status_var.set("분할 작업이 끝났습니다. 다시 실행하려면 미리보기를 확인하세요.")
+            self.status_var.set("분할 작업이 끝났습니다. 결과를 열거나 다음 작업을 시작하세요.")
             return
         lines = ["성공 파일:"]
         lines.extend(str(path) for path in result.succeeded)
@@ -433,6 +479,11 @@ class ExcelSplitterGui:
         self.pattern_var.set(state.pattern)
         if self._busy:
             return
+        if hasattr(self, "split_office_prefix_var"):
+            self.split_office_prefix_var.set(state.office_prefix)
+            self.split_office_prefix_checkbox.configure(state="normal" if state.office_prefix_available else "disabled")
+            self.split_office_note.set("기준 15개 사업소 확인 완료" if state.office_prefix_available else
+                                       "기준 15개 사업소와 모두 일치할 때 사용")
         self.sheet_combo.configure(state="readonly" if state.sheets else "disabled")
         self.column_combo.configure(state="readonly" if state.columns else "disabled")
         self.pattern_entry.configure(state="normal" if state.source else "disabled")
@@ -442,11 +493,10 @@ class ExcelSplitterGui:
         error = validate_output_path(self.output_var.get(), directory=True)
         if hasattr(self, "split_path_note"):
             missing = bool(state.output_dir and not state.output_dir.exists())
-            self.split_path_note.set(error or ("없는 폴더입니다. 미리보기에서 생성 여부를 확인합니다." if missing else "분할 결과를 이 폴더에 저장합니다."))
+            self.split_path_note.set(error or ("없는 폴더입니다. 시작 시 생성 여부를 확인합니다." if missing else "분할 결과를 이 폴더에 저장합니다."))
             self.split_reason_var.set("" if ready and not error else error or "원본 파일, 시트와 분류 컬럼을 선택하세요.")
         ready = ready and not error
-        self.preview_button.configure(state="normal" if ready else "disabled")
-        self.split_button.configure(state="normal" if state.preview else "disabled")
+        self.split_button.configure(state="normal" if ready else "disabled")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -459,7 +509,7 @@ class ExcelSplitterGui:
                 self.error_panel.grid_remove()
             for widget in self._input_widgets:
                 widget.configure(state="disabled")
-            self.root.protocol("WM_DELETE_WINDOW", lambda: None)
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
             self.status_var.set("처리 중입니다...")
         else:
             if self._progress_running:
@@ -499,19 +549,20 @@ class ExcelSplitterGui:
     def _show_result(self, kind: str, paths: tuple[Path, ...], summary: str, rows=()) -> None:
         self.result_paths[kind] = paths
         frame, label, tree, buttons = self.result_panels[kind]
-        label.configure(text=summary + (f"\n{paths[0]}" if paths else ""))
+        self.result_summaries[kind] = summary + ("\n\n" + "\n".join(map(str, paths)) if paths else "")
+        label.configure(text=summary.splitlines()[0])
         tree.delete(*tree.get_children())
+        if not rows:
+            rows = [("완료", path.name, "", "", str(path)) for path in paths]
         for row in rows:
             tree.insert("", "end", values=row)
-        if rows:
-            tree.master.grid()
-        else:
-            tree.master.grid_remove()
         for button in buttons:
             button.configure(state="normal" if paths else "disabled")
         frame.grid()
-        canvas = frame.master.master
-        self.root.after_idle(lambda: (canvas.update_idletasks(), canvas.yview_moveto(1)))
+        self._edit_areas[kind].grid_remove()
+        self._save_rows[kind].grid_remove()
+        self._result_visible.add(kind)
+        getattr(self, kind + "_button").configure(text="새 작업", state="normal")
 
     def _show_result_detail(self, kind: str):
         tree = self.result_panels[kind][2]
@@ -519,9 +570,14 @@ class ExcelSplitterGui:
         if not selection:
             return None
         values = tree.item(selection[0], "values")
+        headings = tuple(tree.heading(column, "text") for column in tree["columns"])
+        return self._show_text("선택 내역 상세 보기", "\n\n".join(f"{heading}\n{value}" for heading, value in zip(headings, values) if value))
+
+    def _show_text(self, title: str, content: str):
         window = tk.Toplevel(self.root)
-        window.title("선택 내역 상세 보기")
+        window.title(title)
         window.geometry("720x440")
+        window.minsize(400, 250)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(0, weight=1)
         text = tk.Text(window, wrap="word", padx=14, pady=14)
@@ -529,23 +585,60 @@ class ExcelSplitterGui:
         bar = ttk.Scrollbar(window, orient="vertical", command=text.yview)
         bar.grid(row=0, column=1, sticky="ns")
         text.configure(yscrollcommand=bar.set)
-        headings = ("구분", "시트 · 키 / 위치", "열", "기준 파일", "대상 파일")
-        text.insert("1.0", "\n\n".join(f"{heading}\n{value}" for heading, value in zip(headings, values)))
+        text.insert("1.0", content)
         text.configure(state="disabled")
+        window.bind("<Escape>", lambda _: window.destroy())
         return window
 
     def _toggle_error_detail(self) -> None:
-        if self.error_text.winfo_manager():
-            self.error_text.grid_remove()
-        else:
-            self.error_text.grid()
+        return self._show_text("오류 상세", self.error_message_var.get() + "\n\n" + self.error_detail)
 
     def _copy_error(self) -> None:
         self.root.clipboard_clear()
         self.root.clipboard_append(self.error_detail)
 
+    def _show_log(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Excel 파일 도구 · 진단 로그")
+        window.geometry("800x460")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=1)
+        path = _log_path(self.logger)
+        ttk.Label(window, text=str(path), padding=10, wraplength=750).grid(row=0, column=0, columnspan=2, sticky="ew")
+        text = tk.Text(window, wrap="word", padx=10, pady=8, font=("맑은 고딕", 9))
+        text.grid(row=1, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(window, command=text.yview)
+        bar.grid(row=1, column=1, sticky="ns")
+        text.configure(yscrollcommand=bar.set)
+
+        def refresh():
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(max(0, path.stat().st_size - 200_000))
+                    content = stream.read().decode("utf-8", errors="replace")
+            except OSError:
+                content = "아직 기록된 로그가 없습니다."
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", content)
+            text.configure(state="disabled")
+            text.see("end")
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text.get("1.0", "end-1c"))
+
+        actions = ttk.Frame(window, padding=10)
+        actions.grid(row=2, column=0, columnspan=2, sticky="e")
+        for title, action in (("새로고침", refresh), ("화면 로그 복사", copy), ("로그 폴더 열기", lambda: self._open_path(path.parent))):
+            ttk.Button(actions, text=title, command=action).pack(side="left", padx=(6, 0))
+        window.bind("<Escape>", lambda _: window.destroy())
+        refresh()
+        return window
+
     def _on_close(self) -> None:
         if self._busy:
+            self.status_var.set("작업 중입니다. 파일 보호를 위해 완료 후 종료해 주세요.")
             return
         try:
             self.controller.shutdown()

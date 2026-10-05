@@ -92,12 +92,22 @@ def describe_error(exc: Exception) -> tuple[str, str]:
         return "파일에 접근할 수 없습니다.", "파일이 다른 프로그램에서 열려 있는지와 저장 폴더의 권한을 확인하세요."
     if isinstance(exc, WorkbookValidationError):
         summary = message if len(message) <= 300 else message[:297] + "…"
-        if "중복" in message:
+        if "중복" in message and "원본 파일" in message:
+            return summary, "병합 목록에서 같은 파일을 한 번만 선택하세요."
+        if "중복" in message and ("Key" in message or "키" in message):
             return summary, "안내된 행의 키 값을 확인하거나, 행을 구분할 키 컬럼을 추가하세요."
-        if "Table" in message or "Key" in message:
-            return summary, "양쪽 파일의 표와 선택한 키 컬럼을 확인하세요."
+        if "날짜 체계" in message:
+            return summary, "Excel에서 원본들의 날짜 체계(1900/1904)를 맞추고 실제 날짜 값도 확인하세요."
+        if "열 이름과 순서" in message:
+            return summary, "병합할 모든 표의 머리글 이름과 열 순서를 첫 번째 파일에 맞추세요."
+        if "확장 범위" in message:
+            return summary, "첫 번째 파일의 표 아래에서 병합을 방해하는 값·수식·메모·병합 셀을 확인하세요."
+        if "Key" in message or "키 컬럼" in message:
+            return summary, "비교할 두 표에 선택한 키 컬럼이 모두 있는지 확인하세요."
+        if "Table" in message:
+            return summary, "안내된 시트의 Excel 표(Table) 개수, 머리글과 연결 상태를 확인하세요."
         if "변경" in message:
-            return summary, "파일의 최신 상태를 확인하고 미리보기 또는 표 불러오기를 다시 실행하세요."
+            return summary, "파일의 최신 상태를 확인한 뒤 다시 시작하세요. 키 비교라면 표를 다시 불러오세요."
         if "경로" in message or "파일명" in message or "폴더" in message or "이미 존재" in message:
             return summary, "저장 위치를 확인하거나 새 파일명 추천을 사용하세요."
         return summary, "입력 파일과 선택한 작업 설정을 확인한 뒤 다시 실행하세요."

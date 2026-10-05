@@ -32,7 +32,6 @@ from excel_splitter.excel_gateway import (
     _column_index,
     _com_stage,
     _contiguous_descending_blocks,
-    _copy_to_master,
     _delete_row_blocks,
     _delete_rows,
     _excel_error_code,
@@ -350,16 +349,23 @@ def test_excel_session_always_quits_and_uninitializes(
         CoInitialize=lambda: events.append("initialize"),
         CoUninitialize=lambda: events.append("uninitialize"),
     )
-    client = SimpleNamespace(DispatchEx=lambda _name: Excel())
     monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
-    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
-    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(excel_gateway, "_create_excel_application", lambda: (Excel(), lambda: events.append("release")))
 
     with pytest.raises(SplitExecutionError, match="Excel 자동화"):
         with _excel_session():
             raise RuntimeError("open failed")
 
-    assert events == ["initialize", "quit", "uninitialize"]
+    assert events == ["initialize", "quit", "release", "uninitialize"]
+
+
+def test_table_filter_clear_reports_noop_and_rejects_silent_failure() -> None:
+    auto_filter = SimpleNamespace(FilterMode=False, ShowAllData=lambda: None)
+    table = SimpleNamespace(AutoFilter=auto_filter)
+    assert excel_gateway._clear_table_filter(table) is False
+    auto_filter.FilterMode = True
+    with pytest.raises(SplitExecutionError, match="필터"):
+        excel_gateway._clear_table_filter(table)
 
 
 def test_excel_session_does_not_swallow_attribute_error_from_with_body(
@@ -375,16 +381,14 @@ def test_excel_session_does_not_swallow_attribute_error_from_with_body(
         CoInitialize=lambda: events.append("initialize"),
         CoUninitialize=lambda: events.append("uninitialize"),
     )
-    client = SimpleNamespace(DispatchEx=lambda _name: Excel())
     monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
-    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
-    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(excel_gateway, "_create_excel_application", lambda: (Excel(), lambda: events.append("release")))
 
     with pytest.raises(SplitExecutionError, match="Excel 자동화"):
         with _excel_session():
             raise AttributeError("missing COM member")
 
-    assert events == ["initialize", "quit", "uninitialize"]
+    assert events == ["initialize", "quit", "release", "uninitialize"]
 
 
 def test_com_stage_includes_hresult_and_excepinfo_without_losing_cause() -> None:
@@ -432,10 +436,8 @@ def test_output_excel_session_does_not_access_calculation_before_workbook_open(
         return excel
 
     pythoncom = SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None)
-    client = SimpleNamespace(DispatchEx=dispatch)
     monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
-    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
-    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(excel_gateway, "_create_excel_application", lambda: (dispatch("Excel.Application"), lambda: None))
 
     output_session = getattr(excel_gateway, "_output_excel_session", None)
     assert output_session is not None
@@ -1380,60 +1382,6 @@ def test_publish_collision_preserves_recovery_without_overwriting_intruder(
     assert target.read_bytes() == b"intruder"
 
 
-def test_copy_to_master_removes_copy_when_signature_does_not_match(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Path("source.xlsx")
-    expected = FileSignature(size=6, mtime_ns=1, sha256="expected")
-    observed = iter(
-        (
-            expected,
-            expected,
-            FileSignature(size=6, mtime_ns=1, sha256="different"),
-        )
-    )
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway._capture_signature", lambda _path: next(observed)
-    )
-    monkeypatch.setattr("excel_splitter.excel_gateway.shutil.copy2", lambda *_args: None)
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway.uuid.uuid4",
-        lambda: SimpleNamespace(hex="token"),
-    )
-    removed: list[Path] = []
-    monkeypatch.setattr(Path, "unlink", lambda path, **_kwargs: removed.append(path))
-
-    with pytest.raises(SplitExecutionError, match="master"):
-        _copy_to_master(source, expected, Path("output"))
-
-    assert removed == [Path("output/.source.master.token.xlsx")]
-
-
-def test_copy_to_master_is_created_in_the_target_parent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = Path("read-only/source.xlsx")
-    output_parent = Path("writable-output")
-    expected = FileSignature(size=6, mtime_ns=1, sha256="expected")
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway._capture_signature", lambda _path: expected
-    )
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway.uuid.uuid4",
-        lambda: SimpleNamespace(hex="token"),
-    )
-    copies: list[tuple[Path, Path]] = []
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway.shutil.copy2",
-        lambda source_path, target_path: copies.append((source_path, target_path)),
-    )
-
-    master = _copy_to_master(source, expected, output_parent)
-
-    assert master == Path("writable-output/.source.master.token.xlsx")
-    assert copies == [(source, master)]
-
-
 def test_write_groups_rejects_mixed_target_parents_before_copying(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1450,10 +1398,6 @@ def test_write_groups_rejects_mixed_target_parents_before_copying(
     targets = (
         OutputTarget(key, "A", Path("one/a.xlsx"), None),
         OutputTarget(key, "A", Path("two/b.xlsx"), None),
-    )
-    monkeypatch.setattr(
-        "excel_splitter.excel_gateway._copy_to_master",
-        lambda *_args: pytest.fail("master copy must not start"),
     )
 
     with pytest.raises(SplitExecutionError, match="같은 출력 폴더"):

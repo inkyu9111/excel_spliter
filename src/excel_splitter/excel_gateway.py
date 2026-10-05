@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,7 +25,6 @@ from .excel_artifacts import (
     unsupported_threaded_comments_error,
 )
 from .models import (
-    CellSample,
     FileSignature,
     OutputTarget,
     SplitResult,
@@ -72,12 +72,6 @@ def _capture_signature(path: Path) -> FileSignature:
     return capture_signature(path)
 
 
-def _group_samples(samples: list[CellSample]):
-    from .classifier import group_samples
-
-    return group_samples(samples)
-
-
 def _same_signature(path: Path, expected: FileSignature | None) -> bool:
     from .file_signature import same_signature
 
@@ -108,23 +102,71 @@ def _com_error_details(exc: Exception) -> str:
     return f" ({'; '.join(details)})" if details else ""
 
 
+def _create_excel_application():
+    """Own every child dispatch so none can outlive its COM apartment."""
+    import pythoncom
+    from win32com.client import dynamic
+
+    owned: dict[int, weakref.ReferenceType] = {}
+
+    def dispatch(value, name=None, _clsid=None):
+        return dynamic.Dispatch(value, name, createClass=SessionDispatch)
+
+    class SessionDispatch(dynamic.CDispatch):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            key = id(self)
+            owned[key] = weakref.ref(self, lambda _ref: owned.pop(key, None))
+
+        def _wrap_dispatch_(self, value, name=None, returnCLSID=None):
+            return dispatch(value, name)
+
+        def _make_method_(self, name):
+            method = super()._make_method_(name)
+            if method is not None:
+                # Generated methods use a module Dispatch function, unlike
+                # property access which uses _wrap_dispatch_.
+                method.__func__.__globals__["Dispatch"] = dispatch
+            return method
+
+    def release():
+        # Caller locals and exception tracebacks can retain Python wrappers;
+        # release their COM pointers while the owning thread is initialized.
+        for reference in reversed(tuple(owned.values())):
+            proxy = reference()
+            if proxy is not None:
+                vars(proxy).update(
+                    _builtMethods_={}, _mapCachedItems_={}, _enum_=None,
+                    _olerepr_=None, _lazydata_=None, _oleobj_=None,
+                )
+        owned.clear()
+
+    try:
+        excel = dispatch(pythoncom.CoCreateInstanceEx(
+            "Excel.Application", None, pythoncom.CLSCTX_LOCAL_SERVER,
+            None, (pythoncom.IID_IDispatch,),
+        )[0], "Excel.Application")
+        return excel, release
+    except BaseException:
+        release()
+        raise
+
+
 @contextmanager
 def _excel_session() -> Iterator[Any]:
     try:
         import pythoncom
-        import win32com.client
     except ImportError as exc:
         raise ExcelUnavailableError("pywin32를 불러올 수 없습니다.") from exc
 
     pythoncom.CoInitialize()
     excel = None
-    original_settings: dict[str, Any] = {}
+    release = None
     try:
-        excel = win32com.client.DispatchEx("Excel.Application")
+        excel, release = _create_excel_application()
         for name, safe_value in zip(
             _APPLICATION_SETTINGS, _SAFE_APPLICATION_VALUES, strict=True
         ):
-            original_settings[name] = getattr(excel, name, None)
             setattr(excel, name, safe_value)
         yield excel
     except ExcelSplitterError:
@@ -132,17 +174,21 @@ def _excel_session() -> Iterator[Any]:
     except Exception as exc:
         raise SplitExecutionError(f"Excel 자동화에 실패했습니다: {exc}{_com_error_details(exc)}") from exc
     finally:
+        active_error = sys.exception()
+        quit_error = None
         if excel is not None:
-            for name, value in original_settings.items():
-                try:
-                    setattr(excel, name, value)
-                except Exception:
-                    pass
             try:
+                # This is our private instance. Keep alerts disabled through
+                # Quit so an unclosed workbook cannot hide a save prompt.
                 excel.Quit()
-            except Exception:
-                pass
+            except Exception as exc:
+                quit_error = exc
+                logging.getLogger(__name__).warning("Excel 종료 실패", exc_info=True)
+        if release is not None:
+            release()
         pythoncom.CoUninitialize()
+        if quit_error is not None and active_error is None:
+            raise SplitExecutionError(f"작업용 Excel을 종료하지 못했습니다: {quit_error}") from quit_error
 
 
 @contextmanager
@@ -239,6 +285,17 @@ def _single_table(tables: Any) -> Any:
     if tables.Count > 1:
         raise WorkbookValidationError("이 시트에는 Table이 2개 이상 있습니다.")
     return tables.Item(1)
+
+
+def _clear_table_filter(table: Any) -> bool:
+    # Worksheet.FilterMode can be False while a ListObject filter is active.
+    auto_filter = getattr(table, "AutoFilter", None)
+    if auto_filter is None or not auto_filter.FilterMode:
+        return False
+    auto_filter.ShowAllData()
+    if auto_filter.FilterMode:
+        raise SplitExecutionError("Table 필터를 해제하지 못했습니다.")
+    return True
 
 
 def _delete_rows(rows: Any, indexes: tuple[int, ...] | list[int]) -> None:
@@ -435,7 +492,14 @@ def _open_workbook(excel: Any, source: Path, *, read_only: bool) -> Any:
 
 
 def _close_without_saving(workbook: Any) -> None:
-    workbook.Close(SaveChanges=False)
+    active_error = sys.exception()
+    try:
+        workbook.Close(SaveChanges=False)
+    except Exception as exc:
+        if active_error is None:
+            raise
+        active_error.add_note(f"통합문서 닫기에도 실패했습니다: {exc}")
+        logging.getLogger(__name__).warning("통합문서 닫기 실패", exc_info=True)
 
 
 def _excel_error_code(value: Any) -> int | None:
@@ -456,7 +520,7 @@ def _verify_target_unchanged(
     if not path.is_file():
         raise OSError(f"기존 대상 파일이 없어졌습니다: {path}")
     if not _same_signature(path, prior_signature):
-        raise OSError(f"대상 파일이 미리보기 후 변경되었습니다: {path}")
+        raise OSError(f"대상 파일이 사전 검사 이후 변경되었습니다: {path}")
 
 
 def _restore_recovery(backup: Path, target: Path, reason: str) -> OSError:
@@ -494,7 +558,7 @@ def _publish_temp(
         ) from exc
     if backup_signature != prior_signature:
         raise _restore_recovery(
-            backup, target_path, "대상 파일이 미리보기 후 변경되었습니다."
+            backup, target_path, "대상 파일이 사전 검사 이후 변경되었습니다."
         )
     try:
         os.rename(temp_path, target_path)
@@ -508,25 +572,6 @@ def _publish_temp(
         raise OSError(
             f"결과는 게시했지만 복구 파일을 삭제하지 못했습니다: {backup}: {exc}"
         ) from exc
-
-
-def _copy_to_master(
-    source: Path, expected: FileSignature, master_parent: Path
-) -> Path:
-    before = _capture_signature(source)
-    if before != expected:
-        raise SplitExecutionError("원본이 미리보기 후 변경되었습니다.")
-    master = master_parent / f".{source.stem}.master.{uuid.uuid4().hex}.xlsx"
-    try:
-        shutil.copy2(source, master)
-        after = _capture_signature(source)
-        copied = _capture_signature(master)
-        if after != expected or copied != expected:
-            raise SplitExecutionError("복사된 master의 파일 서명이 원본과 다릅니다.")
-        return master
-    except Exception:
-        master.unlink(missing_ok=True)
-        raise
 
 
 @contextmanager
@@ -722,10 +767,10 @@ def _write_group_attempt(
             calculation_state = _enable_manual_calculation(excel)
             sheet, table = _validated_table(workbook, snapshot.sheet_name)
             if str(table.Name) != snapshot.table_name:
-                raise SplitExecutionError("Table 식별자가 미리보기와 다릅니다.")
+                raise SplitExecutionError("Table 식별자가 사전 검사 결과와 다릅니다.")
             _column_index(table, snapshot.column_name)
             if int(table.ListRows.Count) != snapshot.row_count:
-                raise SplitExecutionError("Table 행 수가 미리보기와 다릅니다.")
+                raise SplitExecutionError("Table 행 수가 사전 검사 결과와 다릅니다.")
 
         selected = next(
             (group for group in snapshot.groups if group.key == target.key), None
@@ -738,8 +783,7 @@ def _write_group_attempt(
         )
         def mutate() -> None:
             with _com_stage("행 삭제"):
-                if bool(getattr(sheet, "FilterMode", False)):
-                    sheet.ShowAllData()
+                _clear_table_filter(table)
                 if rowwise:
                     _delete_rows(table.ListRows, remove)
                 else:

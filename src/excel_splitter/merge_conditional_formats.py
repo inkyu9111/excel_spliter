@@ -24,6 +24,7 @@ class _Package:
     sheet: minidom.Document
     styles: minidom.Document
     context: tuple
+    sheet_data: bytes | None = None
 
 
 def _elements(node, name):
@@ -64,7 +65,17 @@ def _read(path):
         colors = tuple(node.toxml() for node in _elements(styles, "colors"))
         themes = tuple((name, archive.read(name)) for name in sorted(members) if name.startswith("xl/theme/"))
         context = (bounds[1], bounds[2], bounds[3], themes, colors)
-        return _Package(sheets[0], minidom.parseString(sheet_xml), styles, context)
+        sheet_data = None
+        # Native Excel sheets keep all cells in one UTF-8 sheetData element.
+        # Preserve its bytes instead of building millions of irrelevant DOM
+        # nodes while inspecting a handful of conditional-format rules.
+        if (sheet_xml.startswith(b'<?xml version="1.0" encoding="UTF-8"')
+                and b"<!" not in sheet_xml and b"<sheetData>" in sheet_xml):
+            start = sheet_xml.index(b"<sheetData>")
+            end = sheet_xml.index(b"</sheetData>", start) + len(b"</sheetData>")
+            sheet_data = sheet_xml[start:end]
+            sheet_xml = sheet_xml[:start] + b"<sheetData/>" + sheet_xml[end:]
+        return _Package(sheets[0], minidom.parseString(sheet_xml), styles, context, sheet_data)
 
 
 def _formats(package):
@@ -139,6 +150,10 @@ def restore_full_column_rule(sources: tuple[Path, ...], target: Path) -> bool:
     for node in formats[1:]:
         root.removeChild(node)
     replacement = output.sheet.toxml(encoding="utf-8")
+    if output.sheet_data is not None:
+        if replacement.count(b"<sheetData/>") != 1:
+            raise ValueError("saved sheet data cannot be restored safely")
+        replacement = replacement.replace(b"<sheetData/>", output.sheet_data, 1)
     descriptor, filename = tempfile.mkstemp(prefix=".cf-", suffix=".xlsx", dir=target.parent)
     os.close(descriptor)
     temporary = Path(filename)

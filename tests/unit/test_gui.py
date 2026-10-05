@@ -34,7 +34,7 @@ def test_split_confirmation_warns_only_when_artifacts_will_be_deleted(
         lambda _title, prompt, **_options: prompts.append(prompt) or False,
     )
 
-    gui._split()
+    gui._confirm_split()
 
     expected = DELETED_SHEETS_WARNING
     if has_artifacts:
@@ -52,6 +52,7 @@ def _preview_gui(output_dir: Path, workers: list[object]) -> ExcelSplitterGui:
     )
     gui.pattern_var = SimpleNamespace(get=lambda: "%_분할")
     gui._clear_preview = lambda: None
+    gui._render_state = lambda _: None
     gui._start_worker = workers.append
     return gui
 

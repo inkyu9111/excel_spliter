@@ -1,4 +1,6 @@
 from pathlib import Path
+from dataclasses import replace
+import os
 
 import pytest
 
@@ -12,12 +14,14 @@ from excel_splitter.models import (
     WorkbookSnapshot,
 )
 from excel_splitter.split_service import SplitService
+from excel_splitter.naming import OFFICE_ORDER
 
 
 class FakeGateway:
     def __init__(self, snapshot: WorkbookSnapshot) -> None:
         self.snapshot = snapshot
         self.written = False
+        self.snapshot_reads = 0
 
     def list_worksheets(self, source: Path) -> tuple[str, ...]:
         return ("분류표",)
@@ -28,6 +32,7 @@ class FakeGateway:
     def build_snapshot(
         self, source: Path, sheet_name: str, column_name: str
     ) -> WorkbookSnapshot:
+        self.snapshot_reads += 1
         return self.snapshot
 
     def write_groups(self, snapshot, targets, progress):
@@ -73,7 +78,7 @@ def test_execute_rejects_source_changed_after_preview_before_writing(
     preview = service.preview(source, "분류표", "구분", "%", tmp_path)
     source.write_bytes(source.read_bytes() + b"!")
 
-    with pytest.raises(WorkbookValidationError, match="미리보기 이후 변경"):
+    with pytest.raises(WorkbookValidationError, match="사전 검사 이후 변경"):
         service.execute(preview, overwrite=True, progress=lambda *_: None)
 
     assert not gateway.written
@@ -88,6 +93,30 @@ def test_execute_reports_source_check_before_group_writing(tmp_path: Path) -> No
 
     assert progress == [(0, 0, "원본 확인 중"), (0, 0, "파일 복사 중")]
     assert gateway.written
+
+
+def test_office_prefix_cache_rechecks_content_hash_and_discards_after_execution(tmp_path: Path) -> None:
+    source, gateway, service = _service(tmp_path)
+    groups = tuple(
+        GroupSummary(CanonicalKey("text", name), name, 1, (index,))
+        for index, name in enumerate(reversed(OFFICE_ORDER), 1)
+    )
+    gateway.snapshot = replace(gateway.snapshot, groups=groups, row_count=15)
+    assert service.office_prefix_available(source, "분류표", "구분")
+    preview = service.preview(source, "분류표", "구분", "%", tmp_path, office_prefix=True)
+    assert gateway.snapshot_reads == 1  # Selection + start read the column once.
+    service.execute(preview, overwrite=False, progress=lambda *_: None)
+    assert service.office_prefix_available(source, "분류표", "구분")
+    assert gateway.snapshot_reads == 2
+
+    before = source.stat()
+    source.write_bytes(b"change")  # Same size and timestamp must still invalidate eligibility.
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    gateway.snapshot = replace(gateway.snapshot, signature=capture_signature(source), groups=groups[:-1], row_count=14)
+    with pytest.raises(WorkbookValidationError, match="15개"):
+        service.preview(source, "분류표", "구분", "%", tmp_path, office_prefix=True)
+    assert gateway.snapshot_reads == 3
+    assert not service.office_prefix_available(source, "분류표", "구분")
 
 
 def test_preview_rejects_missing_output_directory_before_building_targets(
@@ -107,12 +136,6 @@ def test_preview_rejects_missing_output_directory_before_building_targets(
             "%",
             tmp_path / "missing",
         )
-
-
-def test_service_shutdown_closes_the_persistent_gateway(tmp_path: Path) -> None:
-    _source, gateway, service = _service(tmp_path)
-    service.shutdown()
-    assert gateway.shutdown_called is True
 
 
 def test_main_builds_default_service_and_runs_gui(

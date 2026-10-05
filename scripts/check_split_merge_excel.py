@@ -10,17 +10,18 @@ from pathlib import Path
 import shutil
 import sys
 from tempfile import TemporaryDirectory
+from time import perf_counter
 from xml.etree import ElementTree
 from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from excel_splitter.errors import WorkbookValidationError
+from excel_splitter.errors import SplitExecutionError, WorkbookValidationError
 from excel_splitter.excel_gateway import ExcelComGateway, _excel_session, _open_workbook
 from excel_splitter.file_signature import capture_signature
 from excel_splitter.merge_service import MergeService
-from excel_splitter.parallel_writer import ParallelWriteAborted
 from excel_splitter.split_service import SplitService
+from check_merge_excel import _new_table
 
 
 HEADERS = ("지역", "순번", "금액", "계산", "문자")
@@ -39,6 +40,25 @@ GROUPS = {
     "": (ROWS[3],),
 }
 MERGED = GROUPS["부산"] + GROUPS[""] + GROUPS["서울"]
+OFFICES = (
+    "서울", "남서울", "인천", "경기북부", "경기", "강원", "충북", "대전세종충남",
+    "전북", "광주전남", "대구", "경북", "부산울산", "경남", "제주",
+)
+OFFICE_HEADERS = ("사업소", "누락", "추가", "공백", "빈셀", "오류", "금액")
+# Independent oracle: reverse input order and repeat 서울; output numbering
+# must follow this literal list, regardless of row order or duplicate rows.
+OFFICE_ROWS = tuple(
+    (
+        office,
+        "서울" if office == "제주" else office,
+        "외부" if index == 15 else office,
+        "제주 " if office == "제주" else office,
+        None if index == 15 else office,
+        -2146826246 if index == 15 else office,
+        index + 1,
+    )
+    for index, office in enumerate((*reversed(OFFICES), "서울"))
+)
 
 
 def checkpoint(name):
@@ -53,6 +73,64 @@ def rejected(error_type, message):
         assert message in str(exc), (message, str(exc))
     else:
         raise AssertionError(f"Expected {error_type.__name__}: {message}")
+
+
+def make_office_source(excel, path):
+    with _new_table(excel, path, OFFICE_HEADERS, OFFICE_ROWS) as (book, sheet, table):
+        sheet.Cells(17, 6).Formula = "=NA()"
+    book = sheet = table = None
+
+
+def check_office_prefix(root: Path):
+    started = perf_counter()
+    checkpoint("exact 15-office eligibility, unchecked order and numbered native Split")
+    with TemporaryDirectory(prefix="office-prefix-", dir=root) as directory:
+        folder = Path(directory)
+        source = folder / "사업소.xlsx"
+        output_dir = folder / "결과"
+        output_dir.mkdir()
+        with _excel_session() as excel:
+            make_office_source(excel, source)
+        original = capture_signature(source)
+        service = SplitService(ExcelComGateway())
+        try:
+            assert service.office_prefix_available(source, "Data", "사업소")
+            plain = service.preview(source, "Data", "사업소", "보고서_%_완료", output_dir)
+            assert tuple(target.path.name for target in plain.targets) == tuple(
+                f"보고서_{office}_완료.xlsx" for office in reversed(OFFICES)
+            )
+            assert not tuple(output_dir.iterdir()), "Eligibility and preview must not create outputs"
+            for column in ("누락", "추가", "공백", "빈셀", "오류"):
+                assert not service.office_prefix_available(source, "Data", column), column
+                with rejected(WorkbookValidationError, "15개 사업소"):
+                    service.preview(source, "Data", column, "보고서_%_완료", output_dir, office_prefix=True)
+                assert not tuple(output_dir.iterdir())
+            numbered = service.preview(source, "Data", "사업소", "보고서_%_완료", output_dir, office_prefix=True)
+            expected = {
+                output_dir / f"{number:02d}_보고서_{office}_완료.xlsx": tuple(row for row in OFFICE_ROWS if row[0] == office)
+                for number, office in enumerate(OFFICES, 1)
+            }
+            assert tuple(target.path for target in numbered.targets) == tuple(expected)
+            result = service.execute(numbered, overwrite=False, progress=lambda *_: None)
+            assert not result.failed, result
+            assert result.succeeded == tuple(expected)
+        finally:
+            service.shutdown()
+        with _excel_session() as excel:
+            for path, expected_rows in expected.items():
+                book = _open_workbook(excel, path, read_only=True)
+                try:
+                    assert book.Sheets.Count == book.Worksheets.Count == 1
+                    table = book.Worksheets.Item("Data").ListObjects.Item(1)
+                    assert table.HeaderRowRange.Value2 == (OFFICE_HEADERS,)
+                    assert table.ListRows.Count == len(expected_rows)
+                    assert table.DataBodyRange.Value2 == expected_rows, path
+                finally:
+                    book.Close(SaveChanges=False)
+                    book = table = None
+        assert capture_signature(source) == original
+        assert set(folder.rglob("*")) == {source, output_dir, *expected}
+    print(f"PASS: exact 15 offices only, duplicate/reversed inputs, canonical prefixes, all saved rows and unchanged source ({perf_counter() - started:.3f}s)", flush=True)
 
 
 def make_source(excel, path, *, empty=False, no_table=False, mismatch=False, multisheet=False, filtered=False):
@@ -134,7 +212,9 @@ def main():
     import win32con
     import win32file
 
-    with TemporaryDirectory(prefix="split-merge-check-") as directory:
+    scratch = Path(__file__).resolve().parents[1] / "build"
+    scratch.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="split-merge-check-", dir=scratch) as directory:
         root = Path(directory) / "한글 경로 공백"
         root.mkdir()
         source = root / "분할 원본.xlsx"
@@ -229,7 +309,7 @@ def main():
                 win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE, None,
                 win32con.OPEN_EXISTING, 0, None)
             try:
-                with rejected(OSError, "기존 대상 파일을 점유하지 못했습니다"):
+                with rejected(SplitExecutionError, "기존 대상 파일을 점유하지 못했습니다"):
                     merge.execute(overwrite_preview, overwrite=True, progress=lambda *_: None)
             finally:
                 handle.Close()
@@ -276,25 +356,22 @@ def main():
             stale = merge.preview((changed, inputs[1]), stale_target)
             with changed.open("ab") as stream:
                 stream.write(b"synthetic stale-preview mutation")
-            with rejected(WorkbookValidationError, "미리보기 이후 변경"):
+            with rejected(WorkbookValidationError, "사전 검사 이후 변경"):
                 merge.execute(stale, overwrite=False, progress=lambda *_: None)
             assert not stale_target.exists()
 
-            checkpoint("known limitation: Split rejects an actively filtered Table")
+            checkpoint("Split includes all rows from an actively filtered Table")
             filtered_dir = root / "필터 제한 점검"
             filtered_dir.mkdir()
             filtered_preview = split.preview(filtered, "분류 표", "지역", "% 분할", filtered_dir)
             assert filtered_preview.snapshot.row_count == 6
-            try:
-                split.execute(filtered_preview, overwrite=False, progress=lambda *_: None)
-            except ParallelWriteAborted as exc:
-                assert "필터링된 범위나 표" in str(exc), str(exc)
-                assert exc.partial_result.failed, exc.partial_result
-                assert set(filtered_dir.iterdir()) == set(exc.partial_result.succeeded), tuple(filtered_dir.iterdir())
-                assert capture_signature(filtered) == originals[filtered]
-                print("KNOWN LIMITATION: filtered Split rejected; original unchanged; temporary files removed", flush=True)
-            else:
-                raise AssertionError("Expected the confirmed active-filter Split rejection; review this limitation")
+            filtered_result = split.execute(filtered_preview, overwrite=False, progress=lambda *_: None)
+            assert not filtered_result.failed, filtered_result
+            assert set(filtered_result.succeeded) == {target.path for target in filtered_preview.targets}
+            assert set(filtered_dir.iterdir()) == set(filtered_result.succeeded)
+            for filtered_target in filtered_preview.targets:
+                check_output(filtered_target.path, GROUPS[filtered_target.label], formulas=True, broken_reference=True)
+            assert capture_signature(filtered) == originals[filtered]
         finally:
             try:
                 split.shutdown()
@@ -307,9 +384,17 @@ def main():
                 )
                 print("PASS: original input SHA-256, size and mtime unchanged (finally)", flush=True)
         checkpoint("temporary output cleanup")
-        expected_files = {*originals, *outputs.values(), target, empty_target, reinput, changed, filtered_dir}
-        assert set(root.iterdir()) == expected_files, tuple(root.iterdir())
-    print("PASS: unfiltered Split -> Merge conservation/order, empty inputs, validation, overwrite, locked outputs, re-input, stale preview, unchanged originals and cleanup; active-filter rejection confirmed separately")
+        expected_paths = {
+            *originals, *outputs.values(), target, empty_target, reinput, changed,
+            filtered_dir, *filtered_result.succeeded,
+        }
+        actual_paths = set(root.rglob("*"))
+        assert actual_paths == expected_paths, {
+            "unexpected": sorted(str(path) for path in actual_paths - expected_paths),
+            "missing": sorted(str(path) for path in expected_paths - actual_paths),
+        }
+        check_office_prefix(root)
+    print("PASS: Split -> Merge conservation/order, active-filter Split, empty inputs, validation, overwrite, locked outputs, re-input, stale preview, unchanged originals and cleanup")
 
 
 if __name__ == "__main__":
