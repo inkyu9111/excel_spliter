@@ -44,7 +44,9 @@ def main():
     rule = '<conditionalFormatting sqref="H1:H1048576"><cfRule type="expression" priority="1"><formula>$H1&gt;0</formula></cfRule></conditionalFormatting>'
     print("20,000 x 8 synthetic cells; times cover CF eligibility inspection only, not Excel or Merge.", flush=True)
     print(f"Current: {cf.__file__}\nBaseline: {args.baseline or '(none)'}", flush=True)
-    with TemporaryDirectory(prefix="merge-cf-benchmark-") as directory:
+    scratch = Path(__file__).resolve().parents[1] / "build"
+    scratch.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="merge-cf-benchmark-", dir=scratch) as directory:
         for has_rule in (False, True):
             path = Path(directory) / f"synthetic-{has_rule}.xlsx"
             with ZipFile(path, "w", ZIP_DEFLATED) as archive:

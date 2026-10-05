@@ -27,6 +27,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.compare_tables = ((), ())
         self.merge_sources: list[Path] = []
         self.merge_preview: MergePreview | None = None
+        self._merge_after_preview = False
         self.source_name_labels = {}
         self._progress_variables = []
         super().__init__(root, controller)
@@ -38,14 +39,17 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._render_etc_state()
 
     def _build(self) -> None:
-        self.root.title("Excel File Toolkit")
+        self.root.title("Excel File Toolkit · 파일 작업")
         self.root.iconbitmap(str(Path(__file__).with_name("assets") / "app.ico"))
         self.root.geometry("900x680")
-        self.root.minsize(740, 520)
+        self.root.minsize(760, 540)
         self.root.option_add("*Font", ("맑은 고딕", 10))
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure(".", font=("맑은 고딕", 10), background="#ffffff", foreground="#172b35")
+        self.root.configure(background="#f4f5f7")
+        style.configure(".", font=("맑은 고딕", 10), background="#ffffff", foreground="#17202b")
+        style.configure("Shell.TFrame", background="#f4f5f7")
+        style.configure("Shell.TLabel", background="#f4f5f7", foreground="#64748b")
         style.configure("TFrame", background="#ffffff")
         style.configure("TFrame", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3")
         style.configure("TLabel", background="#ffffff")
@@ -54,45 +58,49 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         style.configure("TCombobox", fieldbackground="#ffffff", background="#f7f9fa", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=3)
         style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")])
         style.configure("Horizontal.TProgressbar", troughcolor="#eef2f1", background="#18754c", bordercolor="#eef2f1", lightcolor="#18754c", darkcolor="#18754c")
-        style.configure("TButton", padding=(8, 4), background="#ffffff")
-        style.configure("Primary.TButton", background="#18754c", foreground="white", padding=(14, 6))
-        style.map("Primary.TButton", background=[("disabled", "#e4ece7"), ("active", "#105d3b")],
+        style.configure("TButton", padding=(10, 5), background="#ffffff")
+        style.configure("Primary.TButton", background="#1266ad", foreground="white", padding=(16, 7))
+        style.map("Primary.TButton", background=[("disabled", "#e4eaf0"), ("active", "#0c508a")],
                   foreground=[("disabled", "#718279")])
-        style.configure("TNotebook", background="#ffffff", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 6))
-        style.map("TNotebook.Tab", padding=[("selected", (16, 6)), ("!selected", (16, 6))],
-                  background=[("selected", "#edf5f0")], foreground=[("selected", "#18754c")])
-        style.configure("Treeview", rowheight=26, fieldbackground="#ffffff", bordercolor="#d5dde3")
+        style.configure("TNotebook", background="#f4f5f7", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(18, 8))
+        style.map("TNotebook.Tab", padding=[("selected", (18, 8)), ("!selected", (18, 8))],
+                  background=[("selected", "#ffffff"), ("!selected", "#e9edf2")], foreground=[("selected", "#1266ad")])
+        style.configure("Treeview", rowheight=30, fieldbackground="#ffffff", bordercolor="#d5dde3")
+        style.map("Treeview", background=[("selected", "#1266ad")], foreground=[("selected", "white")])
         style.configure("Treeview.Heading", padding=5, background="#f3f6f8")
         style.configure("Section.TLabel", font=("맑은 고딕", 11, "bold"))
         style.configure("Note.TLabel", foreground="#64788a")
-        header = ttk.Frame(self.root, padding=(16, 10))
+        header = ttk.Frame(self.root, padding=(12, 10), style="Shell.TFrame")
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="Excel File Toolkit", font=("맑은 고딕", 15, "bold")).pack(side="left")
-        ttk.Label(header, text="원본은 그대로, 결과는 새 파일로", style="Note.TLabel").pack(side="right")
+        ttk.Label(header, text="Excel 파일 도구", font=("맑은 고딕", 13, "bold"), style="Shell.TLabel",
+                  foreground="#17202b").pack(side="left")
+        ttk.Button(header, text="로그 보기", command=self._show_log).pack(side="right")
+        ttk.Label(header, text="원본 보존 · 검증 후 결과 저장", style="Shell.TLabel").pack(side="right", padx=12)
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.grid(row=1, column=0, sticky="nsew", padx=12)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
-        split_page = self._page("분할")
+        split_page = self._page("파일 분할")
         self._build_split_page(split_page)
         self._build_merge()
         self._build_compare()
         self._build_etc()
         self._build_error_panel()
         self._render_compare_state()
+        self.notebook.select(1)
 
     def _page(self, title: str):
         outer = ttk.Frame(self.notebook)
         self.notebook.add(outer, text=title)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
-        canvas = tk.Canvas(outer, highlightthickness=0, background="#ffffff")
+        canvas = tk.Canvas(outer, highlightthickness=0, background="#f4f5f7")
         canvas.grid(row=0, column=0, sticky="nsew")
         bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         bar.grid(row=0, column=1, sticky="ns")
         canvas.configure(yscrollcommand=bar.set)
-        page = ttk.Frame(canvas, padding=(8, 8, 12, 12))
+        page = ttk.Frame(canvas, padding=(0, 10, 0, 4), style="Shell.TFrame")
         window = canvas.create_window(0, 0, window=page, anchor="nw")
         page.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
@@ -106,7 +114,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         return page
 
     def _section(self, page, row: int, title: str):
-        section = ttk.Frame(page)
+        section = ttk.Frame(page, padding=(12, 8), relief="solid", borderwidth=1)
         section.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         section.columnconfigure(0, weight=1)
         ttk.Label(section, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(2, 5))
@@ -165,9 +173,10 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._wrapped_label(body, textvariable=note, style="Note.TLabel").grid(sticky="ew", pady=(4, 0))
         setattr(self, kind + "_output_entry", entry)
 
-    def _work_footer(self, page, kind, text, action, preview_action=None):
-        footer = ttk.Frame(page)
-        footer.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+    def _work_footer(self, page, kind, text, action):
+        # Keep progress and the next action visible even when settings scroll.
+        footer = ttk.Frame(page.master.master, padding=(12, 10))
+        footer.grid(row=1, column=0, columnspan=2, sticky="ew")
         footer.columnconfigure(0, weight=1)
         status = tk.StringVar(value="파일과 작업 설정을 확인하세요.")
         reason = tk.StringVar()
@@ -180,11 +189,6 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         setattr(self, kind + "_progress", progress)
         self._wrapped_label(footer, textvariable=status, style="Note.TLabel").grid(row=1, column=0, sticky="ew")
         self._wrapped_label(footer, textvariable=reason, style="Note.TLabel").grid(row=2, column=0, sticky="ew")
-        if preview_action:
-            preview = ttk.Button(footer, text="미리보기", command=preview_action)
-            preview.grid(row=1, column=1, rowspan=2, padx=8)
-            self._input_widgets.append(preview)
-            setattr(self, kind + "_preview_button", preview)
         button = ttk.Button(footer, text=text, command=action, style="Primary.TButton")
         button.grid(row=1, column=2, rowspan=2)
         self._input_widgets.append(button)
@@ -252,7 +256,6 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         ttk.Label(body, text="파일명 패턴 · %는 분류값으로 바뀝니다", style="Note.TLabel").grid(sticky="w", pady=(8, 4))
         self.pattern_entry = ttk.Entry(body, textvariable=self.pattern_var)
         self.pattern_entry.grid(sticky="ew", ipady=2)
-        self.pattern_entry.bind("<KeyRelease>", self._pattern_changed)
         self._input_widgets.extend((self.sheet_combo, self.column_combo, self.pattern_entry))
         body = self._section(page, 2, "3   저장 위치")
         self.output_entry, _ = self._path_row(body, self.output_var, self._browse_output, "출력 폴더")
@@ -269,42 +272,48 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         bar = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_tree.yview)
         bar.grid(row=0, column=1, sticky="ns")
         self.preview_tree.configure(yscrollcommand=bar.set)
-        self._work_footer(page, "split", "분할 시작", self._split, self._preview)
-        self.preview_button = self.split_preview_button
+        preview_frame.grid_remove()
+        self._work_footer(page, "split", "분할 시작", self._split)
         self.progress = self.split_progress
         self.status_var = self.split_status_var
 
     def _build_merge(self):
-        page = self._page("병합")
-        body = self._section(page, 0, "1   파일")
-        self.merge_tree = ttk.Treeview(body, columns=("path", "sheet", "rows"), show="headings", height=5, selectmode="browse")
-        for col, title, width in (("path", "파일 · 위에서 아래 순서로 병합", 590), ("sheet", "워크시트", 130), ("rows", "행 수", 70)):
-            self.merge_tree.heading(col, text=title)
-            self.merge_tree.column(col, width=width)
-        self.merge_tree.grid(row=0, column=0, sticky="ew")
-        bar = ttk.Scrollbar(body, orient="vertical", command=self.merge_tree.yview)
-        bar.grid(row=0, column=1, sticky="ns")
-        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.merge_tree.xview)
-        hbar.grid(row=1, column=0, sticky="ew")
-        self.merge_tree.configure(yscrollcommand=bar.set, xscrollcommand=hbar.set)
-        self.merge_selected_path_var = tk.StringVar()
-        self._wrapped_label(body, textvariable=self.merge_selected_path_var, style="Note.TLabel").grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
-        self.merge_tree.bind("<<TreeviewSelect>>", lambda _: self.merge_selected_path_var.set(
-            str(self.merge_sources[int(self.merge_tree.selection()[0])]) if self.merge_tree.selection() else ""))
+        page = self._page("파일 병합")
+        body = self._section(page, 0, "1   병합할 파일")
         actions = ttk.Frame(body)
-        actions.grid(row=3, column=0, sticky="w", pady=6)
+        actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.merge_list_buttons = []
         for i, (label, action) in enumerate((("파일 추가", self._add_merge_files), ("선택 제거", self._remove_merge_file),
+                                            ("목록 비우기", self._clear_merge_files),
                                             ("위로", lambda: self._move_merge_file(-1)), ("아래로", lambda: self._move_merge_file(1)))):
             button = ttk.Button(actions, text=label, command=action)
             button.grid(row=0, column=i, padx=(0, 6))
             self._input_widgets.append(button)
-        body = self._section(page, 1, "2   작업 설정")
-        ttk.Label(body, text="같은 열 이름과 순서의 Excel Table을 목록 순서대로 병합합니다.").grid(sticky="w")
-        ttk.Label(body, text="첫 파일의 서식을 사용합니다. Table 수식은 현재 계산값으로 저장합니다.", style="Note.TLabel").grid(sticky="w", pady=5)
+            self.merge_list_buttons.append(button)
+        actions.columnconfigure(5, weight=1)
+        self.merge_count_var = tk.StringVar(value="파일 0개")
+        ttk.Label(actions, textvariable=self.merge_count_var, style="Note.TLabel").grid(row=0, column=5, sticky="e")
+        self.merge_tree = ttk.Treeview(body, columns=("path", "sheet", "rows", "status"), show="headings", height=6, selectmode="extended")
+        for col, title, width in (("path", "파일 이름 · 위에서 아래 순서로 병합", 390), ("sheet", "시트", 130), ("rows", "데이터 행", 90), ("status", "상태", 110)):
+            self.merge_tree.heading(col, text=title, anchor="w")
+            self.merge_tree.column(col, width=width, minwidth=70, stretch=col == "path", anchor="e" if col == "rows" else "w")
+        self.merge_tree.grid(row=1, column=0, sticky="ew")
+        bar = ttk.Scrollbar(body, orient="vertical", command=self.merge_tree.yview)
+        bar.grid(row=1, column=1, sticky="ns")
+        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.merge_tree.xview)
+        hbar.grid(row=2, column=0, sticky="ew")
+        self.merge_tree.configure(yscrollcommand=bar.set, xscrollcommand=hbar.set)
+        self.merge_selected_path_var = tk.StringVar()
+        self._wrapped_label(body, textvariable=self.merge_selected_path_var, style="Note.TLabel").grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        self.merge_tree.bind("<<TreeviewSelect>>", self._merge_selection_changed)
+        self.merge_tree.bind("<Delete>", lambda _: self._remove_merge_file())
+        body = self._section(page, 1, "2   병합 방식")
+        self._wrapped_label(body, text="같은 열 이름·순서의 Excel 표(Table)를 합칩니다. 첫 파일의 서식을 사용하고 표 데이터 본문 수식은 현재 계산값으로 저장합니다.",
+                            style="Note.TLabel").grid(sticky="ew")
         self.merge_output_var = tk.StringVar()
         self._output_section(page, "merge", self.merge_output_var, self._browse_merge_output)
-        self._work_footer(page, "merge", "병합 시작", self._merge, self._preview_merge)
+        self._work_footer(page, "merge", "병합 시작", self._merge)
 
     def _build_etc(self) -> None:
         page = self._page("시트 정리")
@@ -410,7 +419,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         )), execution=True)
 
     def _build_compare(self) -> None:
-        page = self._page("비교")
+        page = self._page("변경 비교")
         self.compare_reference_var, self.compare_comparison_var, self.compare_output_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
         body = self._section(page, 0, "1   파일")
         body.columnconfigure((0, 1), weight=1)
@@ -519,7 +528,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         if kind == "comparison":
             filename = _unique_filename(f"{path.stem}_비교결과", {p.name.casefold() for p in path.parent.iterdir()})
             self.compare_output_var.set(str(path.parent / filename))
-        self.compare_status_var.set("파일과 결과 저장 위치를 확인하고 비교 및 저장을 누르세요.")
+        self.compare_status_var.set("파일과 결과 저장 위치를 확인하고 비교 시작을 누르세요.")
         self._render_compare_state()
 
     def _browse_compare_output(self) -> None:
@@ -564,10 +573,22 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         error = self._output_error("merge", self.merge_sources)
         ready = len(self.merge_sources) >= 2 and bool(self.merge_output_var.get())
         self.merge_reason_var.set("작업 중에는 설정을 바꿀 수 없습니다." if self._busy else
-                                  error or ("" if self.merge_preview is not None else "파일 두 개 이상을 추가하고 미리보기를 확인하세요."))
+                                  error or ("시작하면 파일을 검사하고 병합합니다." if ready else "파일 두 개 이상을 추가하세요."))
         ready = ready and not error
-        self.merge_preview_button.configure(state="normal" if ready and not self._busy else "disabled")
-        self.merge_button.configure(state="normal" if ready and self.merge_preview is not None and not self._busy else "disabled")
+        self.merge_button.configure(state="normal" if ready and not self._busy else "disabled")
+        self._merge_selection_changed()
+
+    def _merge_selection_changed(self, _event=None) -> None:
+        selection = self.merge_tree.selection()
+        self.merge_selected_path_var.set(str(self.merge_sources[int(selection[0])]) if selection else "파일 추가로 병합할 파일을 선택하세요. Ctrl / Shift로 여러 파일을 선택할 수 있습니다.")
+        count = len(self.merge_sources)
+        self.merge_count_var.set(f"파일 {count:,}개")
+        enabled = not self._busy
+        one = len(selection) == 1
+        for button, available in zip(self.merge_list_buttons[1:], (
+            bool(selection), bool(count), one and int(selection[0]) > 0, one and int(selection[0]) < count - 1,
+        )):
+            button.configure(state="normal" if enabled and available else "disabled")
 
     def _output_error(self, kind: str, sources) -> str:
         value = getattr(self, kind + "_output_var").get()
@@ -612,11 +633,11 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_preview = None
         self.merge_tree.delete(*self.merge_tree.get_children())
         for index, path in enumerate(self.merge_sources):
-            self.merge_tree.insert("", "end", iid=str(index), values=(str(path), "", ""))
+            self.merge_tree.insert("", "end", iid=str(index), values=(path.name, "", "", "검사 전"))
         if self.merge_sources:
             self.merge_tree.selection_set("0")
         self.merge_selected_path_var.set(str(self.merge_sources[0]) if self.merge_sources else "")
-        self.merge_status_var.set(f"파일 {len(self.merge_sources)}개 · 순서를 확인하고 미리보기를 누르세요.")
+        self.merge_status_var.set(f"파일 {len(self.merge_sources)}개 · 순서를 확인하고 병합 시작을 누르세요.")
         self._render_merge_state()
 
     def _add_merge_files(self) -> None:
@@ -632,14 +653,22 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._invalidate_merge_preview()
 
     def _remove_merge_file(self) -> None:
+        if self._busy:
+            return
         selection = self.merge_tree.selection()
         if selection:
-            del self.merge_sources[int(selection[0])]
+            for index in sorted(map(int, selection), reverse=True):
+                del self.merge_sources[index]
+            self._invalidate_merge_preview()
+
+    def _clear_merge_files(self) -> None:
+        if not self._busy:
+            self.merge_sources.clear()
             self._invalidate_merge_preview()
 
     def _move_merge_file(self, step: int) -> None:
         selection = self.merge_tree.selection()
-        if not selection:
+        if self._busy or len(selection) != 1:
             return
         old = int(selection[0])
         new = old + step
@@ -665,17 +694,23 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         target = Path(self.merge_output_var.get())
         self._invalidate_merge_preview()
         self._start_worker(lambda: ("merge_preview", self.merge_service.preview(sources, target)))
+        self._phase = "병합 파일 검사 중"
 
     def _merge(self) -> None:
+        if self._busy or len(self.merge_sources) < 2 or self._output_error("merge", self.merge_sources):
+            return
+        self._merge_after_preview = True
+        self._preview_merge()
+
+    def _execute_merge(self) -> None:
         preview = self.merge_preview
-        if preview is None:
+        if self._busy or preview is None or self._output_error("merge", self.merge_sources):
             return
-        prompt = (f"파일 {len(preview.inputs)}개, 데이터 {preview.row_count}행을 병합합니다.\n"
-                  f"Table 수식은 현재 계산값으로 저장합니다.\n\n{preview.target}")
         if preview.prior_signature is not None:
-            prompt += "\n\n위 기존 결과 파일을 덮어씁니다."
-        if not messagebox.askyesno("병합 확인", prompt, parent=self.root):
-            return
+            prompt = f"기존 결과 파일을 덮어씁니다. 계속할까요?\n\n{preview.target}"
+            if not messagebox.askyesno("결과 덮어쓰기", prompt, parent=self.root):
+                self.merge_status_var.set("덮어쓰기를 취소했습니다. 새 파일명을 지정하고 시작하세요.")
+                return
         self._start_worker(lambda: ("merge_execute", self.merge_service.execute(
             preview, preview.prior_signature is not None,
             lambda completed, total, label: self.events.put(("progress", completed, total, label)),
@@ -696,6 +731,9 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._render_merge_state()
         self._render_compare_state()
         self._render_etc_state()
+        if busy and index == 1:
+            for item in self.merge_tree.get_children():
+                self.merge_tree.set(item, "status", "병합 대기" if self._executing else "검사 중")
 
     def _handle_ok(self, payload: object) -> None:
         tag, value = payload
@@ -723,15 +761,19 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         elif tag == "merge_preview":
             self.merge_preview = value
             for index, item in enumerate(value.inputs):
-                self.merge_tree.item(str(index), values=(str(item.source), item.sheet_name, item.row_count))
+                self.merge_tree.item(str(index), values=(item.source.name, item.sheet_name, f"{item.row_count:,}", "준비 완료"))
             self._set_busy(False)
             self.merge_status_var.set(f"파일 {len(value.inputs)}개 · 데이터 {value.row_count}행 · 병합 준비 완료")
+            if self._merge_after_preview:
+                self._merge_after_preview = False
+                self._execute_merge()
         elif tag == "merge_execute":
-            self._invalidate_merge_preview()
             self._set_busy(False)
-            self.merge_status_var.set("병합 완료 · 결과를 저장했습니다.")
             self._show_result("merge", (Path(value),), "병합 완료")
             self.merge_output_var.set(str(suggest_output_path(value)))
+            for item in self.merge_tree.get_children():
+                self.merge_tree.set(item, "status", "병합 완료")
+            self.merge_status_var.set("병합 완료 · 결과 파일을 열거나 다음 작업을 준비하세요.")
         elif tag == "compare_execute":
             self._set_busy(False)
             modified = getattr(value, "modified_cells", value.changed_cells)
@@ -768,12 +810,24 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             super()._handle_ok(payload)
 
     def _handle_error(self, error: object) -> None:
+        self._merge_after_preview = False
         selected = self.notebook.index(self.notebook.select())
         if selected == 1:
             self._invalidate_merge_preview()
+            for item in self.merge_tree.get_children():
+                self.merge_tree.set(item, "status", "다시 검사 필요")
+        elif selected == 0:
+            self.controller.set_pattern(self.pattern_var.get())
+            self._clear_preview()
         super()._handle_error(error)
         status = (self.status_var, self.merge_status_var, self.compare_status_var, self.etc_status_var)[selected]
         status.set("오류가 발생했습니다. 아래 안내를 확인하고 다시 실행하세요.")
+
+    def _show_progress(self, completed: int, total: int, label: str) -> None:
+        super()._show_progress(completed, total, label)
+        if (self._executing and self.notebook.index(self.notebook.select()) == 1
+                and total == len(self.merge_sources) and 1 <= completed <= total):
+            self.merge_tree.set(str(completed - 1), "status", "데이터 반영")
 
     def _progress_widget(self) -> ttk.Progressbar:
         return (self.progress, self.merge_progress, self.compare_progress, self.etc_progress)[

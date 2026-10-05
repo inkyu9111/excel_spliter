@@ -99,7 +99,8 @@ def main() -> None:
                     sheet.Range("D2").Formula = "=2+2" if index == 0 else "=1+3"
                     sheet.Range("A3").Formula = "=1" if index == 0 else "=2"
                     sheet.Range("B3").Formula = '=""'
-                    sheet.Range("C3").NumberFormat = "@" if index == 0 else "General"
+                    if index == 0:
+                        sheet.Range("C3").NumberFormat = "@"
                     sheet.Range("C3").Value2 = "7" if index == 0 else 7
                     if index == 0:
                         sheet.Range("D3").Formula = "=1/0"

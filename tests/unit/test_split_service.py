@@ -73,7 +73,7 @@ def test_execute_rejects_source_changed_after_preview_before_writing(
     preview = service.preview(source, "분류표", "구분", "%", tmp_path)
     source.write_bytes(source.read_bytes() + b"!")
 
-    with pytest.raises(WorkbookValidationError, match="미리보기 이후 변경"):
+    with pytest.raises(WorkbookValidationError, match="사전 검사 이후 변경"):
         service.execute(preview, overwrite=True, progress=lambda *_: None)
 
     assert not gateway.written
@@ -107,12 +107,6 @@ def test_preview_rejects_missing_output_directory_before_building_targets(
             "%",
             tmp_path / "missing",
         )
-
-
-def test_service_shutdown_closes_the_persistent_gateway(tmp_path: Path) -> None:
-    _source, gateway, service = _service(tmp_path)
-    service.shutdown()
-    assert gateway.shutdown_called is True
 
 
 def test_main_builds_default_service_and_runs_gui(

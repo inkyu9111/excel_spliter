@@ -371,12 +371,12 @@ def test_execute_rejects_missing_or_invalidated_preview() -> None:
     service = FakeService()
     controller = _ready_controller(service)
 
-    with pytest.raises(RuntimeError, match="미리보기"):
+    with pytest.raises(RuntimeError, match="사전 검사"):
         controller.execute(False, lambda *_: None)
 
     controller.create_preview()
     controller.set_pattern("%_결과")
-    with pytest.raises(RuntimeError, match="미리보기"):
+    with pytest.raises(RuntimeError, match="사전 검사"):
         controller.execute(False, lambda *_: None)
 
 

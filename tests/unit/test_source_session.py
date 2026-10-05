@@ -552,3 +552,57 @@ def test_save_plain_master_reports_plaintext_path_when_unlink_fails(
             session.save_plain_master(run_dir, snapshot)
     finally:
         session.shutdown()
+
+
+def test_failed_prewarm_can_start_again_and_process_source(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    source.write_bytes(b"source")
+    attempts = 0
+    events = []
+    workbook = Workbook(events)
+    excel = Excel(events, lambda _path: workbook)
+
+    @contextmanager
+    def factory():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("Excel busy during startup")
+        yield excel
+
+    session = SourceSession(session_factory=factory)
+    with pytest.raises(RuntimeError, match="startup"):
+        session.start()
+    session.start()
+    try:
+        assert session.open_source(source).sheets == ("Data",)
+    finally:
+        session.shutdown()
+    assert attempts == 2
+
+
+def test_shutdown_reports_excel_cleanup_failure() -> None:
+    @contextmanager
+    def factory():
+        yield object()
+        raise RuntimeError("Excel did not quit")
+
+    session = SourceSession(session_factory=factory)
+    session.start()
+    with pytest.raises(SplitExecutionError, match="Excel did not quit"):
+        session.shutdown()
+
+
+def test_shutdown_reports_a_worker_that_already_stopped() -> None:
+    @contextmanager
+    def factory():
+        yield object()
+
+    session = SourceSession(session_factory=factory)
+    session.start()
+    session._requests.put(())  # Fail the dispatcher outside a request handler.
+    session._thread.join(timeout=2)
+    assert not session._thread.is_alive()
+    with pytest.raises(SplitExecutionError, match="Excel 원본 세션"):
+        session.shutdown()
+    session.shutdown()

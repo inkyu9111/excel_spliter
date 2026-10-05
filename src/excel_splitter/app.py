@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import logging
 import tkinter as tk
 
 from .controller import AppController
@@ -16,7 +17,7 @@ def _prewarm_gateway(gateway: ExcelComGateway) -> None:
     except Exception:
         # The first real action retries this startup path and shows the
         # existing localized error; bootstrap must not terminate the GUI.
-        pass
+        logging.getLogger(__name__).warning("Excel 사전 시작 실패; 다음 작업에서 재시도합니다.", exc_info=True)
 
 
 def main(service: SplitServicePort | None = None) -> None:

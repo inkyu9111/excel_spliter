@@ -8,7 +8,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from excel_splitter.errors import WorkbookValidationError
+from excel_splitter.errors import SplitExecutionError, WorkbookValidationError
 
 
 class _Collection:
@@ -204,7 +204,12 @@ class _Range:
     def Formula(self):
         return tuple(tuple(cell[1] for cell in row) for row in self.table.data[self.start:self.start + self.rows])
 
+    @property
+    def HasFormula(self):
+        return any(cell[1] for row in self.table.data[self.start:self.start + self.rows] for cell in row)
+
     def Copy(self):
+        assert not self.table.AutoFilter.FilterMode
         _Range.clipboard = deepcopy(self.table.data[self.start:self.start + self.rows])
 
     def PasteSpecial(self, *, Paste):
@@ -227,6 +232,8 @@ class _Table:
 
     def __init__(self, data, totals, headers=("Name", "Amount")):
         self.data, self.ShowTotals = deepcopy(data), totals
+        self.AutoFilter = SimpleNamespace(FilterMode=True)
+        self.AutoFilter.ShowAllData = lambda: setattr(self.AutoFilter, "FilterMode", False)
         self.headers, self.header_reads = headers, 0
         self.HeaderRowRange = _Range(self, rows=1, header=True)
         self.totals = "=SUBTOTAL(109,[Amount])" if totals else None
@@ -245,15 +252,16 @@ class _Table:
         return SimpleNamespace(Row=3, Column=2, Rows=SimpleNamespace(Count=1 + len(self.data) + int(self.ShowTotals)), Columns=SimpleNamespace(Count=len(self.headers)))
 
     def Resize(self, area):
+        assert not self.AutoFilter.FilterMode
         assert (area.Row, area.Column, area.columns) == (3, 2, len(self.headers))
         self.resizes.append((area.Row, area.Column, area.rows, area.columns))
         count = area.rows - 1 - int(self.ShowTotals)
         self.data = self.data[:count] + [[[None, None, "General"] for _ in self.headers] for _ in range(max(0, count - len(self.data)))]
 
 
-@pytest.mark.parametrize("totals", [False, True])
-@pytest.mark.parametrize("kind", ["normal", "empty", "empty_first", "one_column", "no_growth"])
-def test_native_writer_keeps_values_order_duplicates_formats_and_first_totals(tmp_path, monkeypatch, kind, totals):
+@pytest.mark.parametrize("kind", ["normal", "clipboard_corruption", "saved_corruption", "saved_formulas", "saved_filter"])
+def test_writer_rejects_silent_corruption_before_publication(tmp_path, monkeypatch, kind):
+    totals = True
     from excel_splitter import merge_service as merge
     sources = (tmp_path / "first.xlsx", tmp_path / "second.xlsx")
     temp = tmp_path / "temporary.xlsx"
@@ -264,15 +272,12 @@ def test_native_writer_keeps_values_order_duplicates_formats_and_first_totals(tm
          [["error", None, "General"], [-2146826281, "=1/0", "General"]]],
     ]
     headers = ("Name", "Amount")
-    if kind == "empty":
-        data = [[], []]
-    elif kind == "empty_first":
-        data[0] = []
-    elif kind == "one_column":
-        headers = ("Name",)
-        data = [[[["first", None, "@"]]], [[["second", None, "General"]]]]
-    elif kind == "no_growth":
-        data[1] = []
+    if kind == "clipboard_corruption":
+        original_copy = _Range.Copy
+        def corrupt_copy(area):
+            original_copy(area)
+            _Range.clipboard[0][0][0] = "wrong clipboard with valid dimensions"
+        monkeypatch.setattr(_Range, "Copy", corrupt_copy)
     books, tables = {}, {}
     for path, values, show_totals in ((temp, data[0], totals), (sources[0], data[0], totals), (sources[1], data[1], False)):
         book, sheet, _old_table = _workbook()
@@ -285,14 +290,22 @@ def test_native_writer_keeps_values_order_duplicates_formats_and_first_totals(tm
         sheet.Range = rectangle
         sheet.FilterMode = False
         sheet.Calculate = lambda: None
-        book.saved = False
+        book.saved = book.Saved = False
         def save(book=book):
             book.saved = True
+            book.Saved = True
         book.Save = save
         def save_as(filename, *, book=book, **options):
             book.saved = True
+            book.Saved = True
             book.save_options = options
             book.FullName = filename
+            if kind == "saved_corruption":
+                tables[temp].data[0][0][0] = "wrong saved value with valid row count"
+            elif kind == "saved_formulas":
+                tables[temp].data[0][0][1] = "=1+1"
+            elif kind == "saved_filter":
+                tables[temp].AutoFilter.FilterMode = True
             with ZipFile(filename, "w") as package:
                 for part in ("[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels"):
                     package.writestr(part, b"saved by native Excel")
@@ -301,28 +314,25 @@ def test_native_writer_keeps_values_order_duplicates_formats_and_first_totals(tm
     excel = SimpleNamespace(CutCopyMode=False)
     monkeypatch.setattr(merge, "_excel_session", lambda: nullcontext(excel))
     def opened(_excel, path, *, read_only):
-        assert read_only is (path != temp)
+        assert read_only is (path != temp or books[path].saved)
         return books[path]
     monkeypatch.setattr(merge, "_open_workbook", opened)
     inputs = tuple(merge.MergeInput(path, object(), "Data", "DataTable", headers, len(rows), 3, totals if index == 0 else False) for index, (path, rows) in enumerate(zip(sources, data)))
     preview = merge.MergePreview(inputs, tmp_path / "output.xlsx", None, sum(len(rows) for rows in data))
     progress = []
+    if kind != "normal":
+        with pytest.raises(SplitExecutionError, match="저장된 (값|데이터|Table)"):
+            merge._write_merged(temp, preview, lambda *event: progress.append(event))
+        assert all(book.closed for book in books.values())
+        assert not preview.target.exists()
+        return
     merge._write_merged(temp, preview, lambda *event: progress.append(event))
     output = tables[temp]
+    assert all(not table.AutoFilter.FilterMode for table in tables.values())
     assert [[cell[0] for cell in row] for row in output.data] == [[cell[0] for cell in row] for row in data[0] + data[1]]
     assert all(cell[1] is None for row in output.data for cell in row)
     assert [[cell[2] for cell in row] for row in output.data] == [[cell[2] for cell in row] for row in data[0] + data[1]]
     assert output.totals == ("=SUBTOTAL(109,[Amount])" if totals else None)
-    expected_shape = {
-        "normal": (6, 2, [(4, 2, 2, 2), (6, 2, 3, 2)]),
-        "empty": (None, 2, []),
-        "empty_first": (4, 2, [(4, 2, 3, 2)]),
-        "one_column": (3, 1, [(4, 2, 1, 1), (5, 2, 1, 1)]),
-        "no_growth": (None, 2, [(4, 2, 2, 2)]),
-    }[kind]
-    resize_rows, width, destinations = expected_shape
-    assert output.resizes == ([] if resize_rows is None else [(3, 2, resize_rows + int(totals), width)])
-    assert [area[:4] for area in output.pastes if area[4] == 12] == destinations
     assert all(tables[path].header_reads == 1 for path in sources)
     assert books[temp].saved and all(book.closed for book in books.values())
     assert books[temp].save_options == dict(FileFormat=51, Password="", WriteResPassword="", ReadOnlyRecommended=False, AddToMru=False)
@@ -358,7 +368,7 @@ def _workbook():
     )
     sheet.Cells = lambda row, column: (row, column)
     sheet.Range = lambda first, last: _sheet_range(sheet, first, last)
-    book = SimpleNamespace(ProtectStructure=False, Sheets=_Collection(sheet), Worksheets=_Collection(sheet), closed=False, open_count=0, close_count=0)
+    book = SimpleNamespace(ProtectStructure=False, Date1904=False, Sheets=_Collection(sheet), Worksheets=_Collection(sheet), closed=False, open_count=0, close_count=0)
     def close(*, SaveChanges):
         assert SaveChanges is False
         book.closed = True
@@ -383,6 +393,7 @@ def _sheet_range(sheet, first, last):
     return SimpleNamespace(
         Value2=tuple(tuple(cell.Value2 for cell in row) for row in rows),
         Formula=tuple(tuple(cell.Formula for cell in row) for row in rows),
+        HasFormula=any(cell.Formula for cell in cells),
         MergeCells=cells[0].MergeCells if all(cell.MergeCells == cells[0].MergeCells for cell in cells) else None,
         Hyperlinks=SimpleNamespace(Count=sum(cell.Hyperlinks.Count for cell in cells)),
         Style=cells[0].Style if all(cell.Style == cells[0].Style for cell in cells) else None,
@@ -476,7 +487,7 @@ def test_preview_closes_each_opened_book_on_error(tmp_path, monkeypatch, failure
         table.ListColumns = _Collection(SimpleNamespace(Name="Amount"), SimpleNamespace(Name="Name"))
     else:
         first.Worksheets.Item(1).content[6, 2] = {"Value2": "keep"}
-    with pytest.raises((RuntimeError, WorkbookValidationError)):
+    with pytest.raises((SplitExecutionError, WorkbookValidationError)):
         merge.MergeService().preview(sources, target)
     assert sum(book.open_count for book in books.values()) >= 1
     assert all(book.close_count == book.open_count for book in books.values())

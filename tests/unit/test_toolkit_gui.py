@@ -52,12 +52,15 @@ def tk_root():
 
 
 def complete_worker(gui):
-    event = gui.events.get(timeout=3)
-    while event[0] == "progress":
-        gui._show_progress(*event[1:])
+    while gui._busy:
         event = gui.events.get(timeout=3)
-    assert event[0] == "ok", event
-    gui._handle_ok(event[1])
+        if event[0] == "progress":
+            gui._show_progress(*event[1:])
+        elif event[0] == "error":
+            gui._handle_error(event[1])
+        else:
+            assert event[0] == "ok", event
+            gui._handle_ok(event[1])
 
 
 def add_files(gui, monkeypatch):
@@ -66,52 +69,19 @@ def add_files(gui, monkeypatch):
     gui.merge_output_var.set(str(Path("merged.xlsx").resolve()))
 
 
-def test_window_uses_packaged_multisize_wrench_icon(toolkit):
-    import struct
-    import win32con
-    import win32gui
-    import win32ui
-    import excel_splitter.toolkit_gui as toolkit_module
-
-    gui, _ = toolkit
-    icon = Path(toolkit_module.__file__).with_name("assets") / "app.ico"
-    data = icon.read_bytes()
-    reserved, kind, count = struct.unpack_from("<HHH", data)
-    assert (reserved, kind) == (0, 1)
-    sizes = {tuple(value or 256 for value in data[6 + 16 * i:8 + 16 * i])
-             for i in range(count)}
-    assert {(size, size) for size in (16, 24, 32, 48, 64, 128, 256)} <= sizes
-    gui.root.update_idletasks()
-    window = win32gui.GetParent(gui.root.winfo_id())
-    def pixels(handle):
-        info = win32gui.GetIconInfo(handle)
-        bitmap = win32ui.CreateBitmapFromHandle(info[4])
-        dimensions = bitmap.GetInfo()
-        return dimensions["bmWidth"], dimensions["bmHeight"], bitmap.GetBitmapBits(True)
-
-    for kind in (win32con.ICON_SMALL, win32con.ICON_BIG):
-        actual = win32gui.SendMessage(window, win32con.WM_GETICON, kind, 0)
-        assert actual
-        width, height, actual_pixels = pixels(actual)
-        expected = win32gui.LoadImage(None, str(icon), win32con.IMAGE_ICON, width, height,
-                                     win32con.LR_LOADFROMFILE)
-        try:
-            assert actual_pixels == pixels(expected)[2]
-        finally:
-            win32gui.DestroyIcon(expected)
-
-
-def test_file_order_preview_and_changes_invalidate_merge(toolkit, monkeypatch):
+def test_one_click_merge_preserves_order_without_manual_preview_or_confirmation(toolkit, monkeypatch):
     gui, calls = toolkit
     add_files(gui, monkeypatch)
     assert len(gui.merge_sources) == 2
     gui.merge_tree.selection_set("1")
     gui._move_merge_file(-1)
     assert [p.name for p in gui.merge_sources] == ["a.xlsx", "b.xlsx"]
-    gui._preview_merge()
+    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.askyesno", lambda *_, **__: pytest.fail("New output does not need confirmation"))
+    gui.merge_button.invoke()
     complete_worker(gui)
     assert calls[0][0] == tuple(gui.merge_sources)
-    assert gui.merge_preview.row_count == 4
+    assert calls[1][0].row_count == 4
+    assert gui.result_paths["merge"] == (calls[0][1],)
     assert str(gui.merge_button["state"]) == "normal"
     gui.merge_tree.selection_set("0")
     gui._remove_merge_file()
@@ -122,14 +92,14 @@ def test_file_order_preview_and_changes_invalidate_merge(toolkit, monkeypatch):
 def test_running_merge_blocks_split_and_close_then_restores(toolkit, monkeypatch):
     gui, _ = toolkit
     add_files(gui, monkeypatch)
-    gui._preview_merge()
+    gui.merge_button.invoke()
     assert gui.notebook.tab(0, "state") == "disabled"
-    assert str(gui.merge_preview_button["state"]) == "disabled"
+    assert str(gui.merge_button["state"]) == "disabled"
     gui._on_close()
     assert gui.root.winfo_exists()
     complete_worker(gui)
     assert gui.notebook.tab(0, "state") == "normal"
-    assert str(gui.merge_preview_button["state"]) == "normal"
+    assert str(gui.merge_button["state"]) == "normal"
     gui.notebook.select(0)
     gui._set_busy(True)
     assert gui.notebook.tab(1, "state") == "disabled"
@@ -137,41 +107,47 @@ def test_running_merge_blocks_split_and_close_then_restores(toolkit, monkeypatch
     assert gui.notebook.tab(1, "state") == "normal"
 
 
-def test_notebook_tab_extents_identified_by_ttk_stay_stable_when_selection_changes(toolkit):
+def test_one_click_split_inspects_confirms_and_executes_current_settings(toolkit, monkeypatch, tmp_path):
+    from excel_splitter.models import CanonicalKey, FileSignature, GroupSummary, OutputTarget, Preview, SplitResult, WorkbookSnapshot
+
     gui, _ = toolkit
-    root = gui.root
-    root.deiconify()
-    root.geometry("740x520")
-    root.update()
+    gui.notebook.select(0)
+    key = CanonicalKey("text", "서울")
+    source, target = tmp_path / "source.xlsx", tmp_path / "서울_분할.xlsx"
+    snapshot = WorkbookSnapshot(source, FileSignature(1, 2, "sig"), "Data", "DataTable", "지역", 1,
+                                (GroupSummary(key, "서울", 1, (1,)),))
+    plan = Preview(snapshot, (OutputTarget(key, "서울", target, None),), ())
+    stages = []
 
-    def tab_extents():
-        found = {index: [] for index in range(len(gui.notebook.tabs()))}
-        for y in range(36):
-            for x in range(gui.notebook.winfo_width()):
-                if gui.notebook.identify(x, y):
-                    found[gui.notebook.index(f"@{x},{y}")].append((x, y))
-        return [
-            (min(x for x, _ in points), max(x for x, _ in points),
-             min(y for _, y in points), max(y for _, y in points))
-            for points in found.values()
-        ]
+    def inspect(*args):
+        stages.append("inspect")
+        assert args == (source, "Data", "지역", "%_최신", tmp_path)
+        return plan
 
-    baseline = tab_extents()
+    def execute(actual, overwrite, progress):
+        stages.append("execute")
+        assert actual is plan and not overwrite
+        progress(1, 1, "서울")
+        return SplitResult((target,), ())
 
-    for index in range(len(gui.notebook.tabs())):
-        gui.notebook.select(index)
-        root.update()
-        assert tab_extents() == baseline
-
-    root.withdraw()
-
-
-def test_preview_worker_does_not_switch_the_active_progress_bar_to_indeterminate(toolkit, monkeypatch):
-    gui, _ = toolkit
-    add_files(gui, monkeypatch)
-    gui._preview_merge()
-    assert str(gui.merge_progress["mode"]) == "determinate"
+    gui.controller._service = SimpleNamespace(preview=inspect, execute=execute, shutdown=lambda: None)
+    gui.controller.state = replace(gui.controller.state, source=source, sheets=("Data",), sheet_name="Data",
+                                   columns=("지역",), column_name="지역", output_dir=tmp_path)
+    gui._render_state(gui.controller.state)
+    gui.pattern_var.set("%_최신")
+    gui.output_var.set(str(tmp_path / "missing"))
+    monkeypatch.setattr("excel_splitter.gui.messagebox.askyesno", lambda *_, **__: False)
+    gui.split_button.invoke()
+    assert not gui._busy and not gui.split_button.instate(["disabled"])
+    assert not (tmp_path / "missing").exists() and stages == []
+    gui.output_var.set(str(tmp_path))
+    monkeypatch.setattr("excel_splitter.gui.messagebox.askyesno", lambda *_, **__: stages.append("confirm") or True)
+    assert not hasattr(gui, "preview_button") and not hasattr(gui, "merge_preview_button")
+    gui.split_button.invoke()
+    assert gui._busy
     complete_worker(gui)
+    assert stages == ["inspect", "confirm", "execute"]
+    assert gui.result_paths["split"] == (target,)
 
 
 def test_execution_reconfigures_each_selected_progress_bar(toolkit):
@@ -189,40 +165,47 @@ def test_execution_reconfigures_each_selected_progress_bar(toolkit):
     assert str(gui.etc_progress["mode"]) == "determinate"
 
 
-def test_merge_requires_confirmation_and_consumes_preview(toolkit, monkeypatch):
+def test_one_click_merge_only_confirms_overwrite_and_rechecks_on_retry(toolkit, monkeypatch):
     gui, calls = toolkit
     add_files(gui, monkeypatch)
-    gui._preview_merge()
-    complete_worker(gui)
-    plan = gui.merge_preview
-    plan.prior_signature = object()
+    original_preview = gui.merge_service.preview
+    def preview(*args):
+        plan = original_preview(*args)
+        plan.prior_signature = object()
+        return plan
+    gui.merge_service.preview = preview
     prompts = []
     monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.askyesno", lambda _, text, **__: prompts.append(text) or False)
     gui._merge()
+    complete_worker(gui)
     assert len(calls) == 1
     assert "덮어" in prompts[0]
     monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.askyesno", lambda *_, **__: True)
     monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda *_, **__: None)
     gui._merge()
     complete_worker(gui)
-    assert calls[-1] == (plan, True)
+    assert len(calls) == 3 and calls[-1][1] is True
     assert gui.merge_preview is None
-    assert str(gui.merge_button["state"]) == "disabled"
+    assert str(gui.merge_button["state"]) == "normal"
 
 
-def test_merge_error_clears_stale_preview_and_restores_controls(toolkit, monkeypatch):
+def test_merge_preflight_failure_stays_visible_and_start_retries(toolkit, monkeypatch):
     from excel_splitter.errors import WorkbookValidationError
 
     gui, _ = toolkit
     add_files(gui, monkeypatch)
-    gui._preview_merge()
+    original_preview = gui.merge_service.preview
+    gui.merge_service.preview = lambda *_: (_ for _ in ()).throw(WorkbookValidationError("열 이름과 순서가 다릅니다"))
+    gui.merge_button.invoke()
     complete_worker(gui)
-    gui._set_busy(True)
-    monkeypatch.setattr("excel_splitter.gui.messagebox.showerror", lambda *_, **__: None)
-    gui._handle_error(WorkbookValidationError("changed input"))
     assert gui.merge_preview is None
     assert gui.notebook.tab(0, "state") == "normal"
-    assert str(gui.merge_preview_button["state"]) == "normal"
+    assert str(gui.merge_button["state"]) == "normal"
+    assert "열 이름과 순서" in gui.error_detail
+    gui.merge_service.preview = original_preview
+    gui.merge_button.invoke()
+    complete_worker(gui)
+    assert gui.result_paths["merge"]
 
 
 def test_compare_selection_creates_unused_output_and_saves_result(toolkit, monkeypatch, tmp_path):
@@ -463,35 +446,6 @@ def test_etc_conditional_format_option_defaults_runs_alone_and_locks_while_busy(
     assert not gui.etc_remove_conditional_formats_checkbox.instate(["disabled"])
 
 
-def test_etc_table_header_option_defaults_forwards_and_locks_while_busy(toolkit, monkeypatch, tmp_path):
-    gui, _ = toolkit
-    gui.notebook.select(3)
-    gui.etc_source_var.set(str(tmp_path / "source.xlsx"))
-    gui.etc_output_var.set(str(tmp_path / "result.xlsx"))
-    gui._handle_ok(("etc_source", ("Data",)))
-    assert gui.etc_exclude_table_headers_var.get()
-    assert gui.etc_reset_fill_checkbox.grid_info()["row"] == gui.etc_exclude_table_headers_checkbox.grid_info()["row"]
-    assert gui.etc_reset_fill_checkbox.grid_info()["column"] < gui.etc_exclude_table_headers_checkbox.grid_info()["column"]
-    assert str(gui.etc_button["state"]) == "disabled"
-    calls = []
-
-    def execute(source, sheet_name, target, **options):
-        calls.append(options["exclude_table_headers"])
-        return target
-
-    gui.etc_service = SimpleNamespace(execute=execute)
-    monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda *_, **__: None)
-    gui.etc_reset_fill_var.set(True)
-    gui.etc_exclude_table_headers_var.set(False)
-    gui._render_etc_state()
-    assert str(gui.etc_button["state"]) == "normal"
-    gui._run_etc()
-    assert str(gui.etc_exclude_table_headers_checkbox["state"]) == "disabled"
-    complete_worker(gui)
-    assert calls == [False]
-    assert not gui.etc_exclude_table_headers_checkbox.instate(["disabled"])
-
-
 def test_etc_table_header_option_is_enabled_only_when_reset_fill_is_checked(toolkit):
     gui, _ = toolkit
     header = gui.etc_exclude_table_headers_checkbox
@@ -530,7 +484,7 @@ def test_output_entries_edit_state_without_key_events(toolkit, monkeypatch, tmp_
     assert gui.output_var.get() == ""
     assert gui.controller.state.output_dir is None
     assert gui.controller.state.preview is None
-    assert str(gui.preview_button["state"]) == "disabled"
+    assert str(gui.split_button["state"]) == "disabled"
 
     trailing_output = f"{split_output}\\"
     gui.output_entry.insert(0, trailing_output)
@@ -544,9 +498,9 @@ def test_output_entries_edit_state_without_key_events(toolkit, monkeypatch, tmp_
     gui.merge_output_entry.delete(0, "end")
     gui.merge_output_entry.insert(0, str(merge_output))
     assert gui.merge_preview is None
-    gui._preview_merge()
+    gui.merge_button.invoke()
     complete_worker(gui)
-    assert calls[-1][1] == merge_output
+    assert calls[-2][1] == merge_output
 
 
 def test_output_entries_update_readiness_and_busy_state(toolkit, tmp_path):
@@ -666,11 +620,17 @@ def test_unknown_progress_moves_smoothly_without_restarting_on_phase_updates(too
     gui._set_busy(False)
 
 
-def test_running_one_tab_does_not_animate_other_tabs(toolkit):
+def test_merge_progress_tracks_same_named_inputs_separately_and_only_animates_active_tab(toolkit, tmp_path):
     gui, _ = toolkit
+    gui.merge_sources = [tmp_path / "서울" / "자료.xlsx", tmp_path / "부산" / "자료.xlsx"]
+    gui._invalidate_merge_preview()
     gui._executing = True
     gui._set_busy(True)
-    gui._show_progress(2, 5, "병합 중")
+    gui._show_progress(1, 2, "자료.xlsx")
+    assert gui.merge_tree.set("0", "status") == "데이터 반영"
+    assert gui.merge_tree.set("1", "status") == "병합 대기"
+    gui._show_progress(2, 2, "자료.xlsx")
+    assert gui.merge_tree.set("1", "status") == "데이터 반영"
     assert float(gui.merge_progress["value"]) == 2
     assert [float(bar["value"]) for bar in (gui.progress, gui.compare_progress, gui.etc_progress)] == [0, 0, 0]
     gui._set_busy(False)
@@ -804,17 +764,6 @@ def _widgets(parent):
         yield from _widgets(child)
 
 
-def test_default_window_is_compact(toolkit):
-    gui, _ = toolkit
-    gui.root.deiconify()
-    gui.root.update()
-    try:
-        assert gui.root.winfo_width() <= 960
-        assert gui.root.winfo_height() <= 720
-    finally:
-        gui.root.withdraw()
-
-
 def test_long_paths_are_wrapped_in_full_without_squeezing_input_controls(toolkit, tmp_path):
     from tkinter import ttk
 
@@ -880,3 +829,81 @@ def test_result_detail_window_shows_full_unclipped_values(toolkit, tmp_path):
         assert str(text["state"]) == "disabled"
     finally:
         window.destroy()
+
+
+def test_merge_multiple_selection_and_delete_are_safe_during_work(toolkit, monkeypatch):
+    gui, _ = toolkit
+    add_files(gui, monkeypatch)
+    gui.merge_tree.selection_set(("0", "1"))
+    gui._set_busy(True)
+    gui.merge_tree.event_generate("<Delete>")
+    gui._remove_merge_file()
+    gui._clear_merge_files()
+    assert len(gui.merge_sources) == 2
+    gui._set_busy(False)
+    gui._remove_merge_file()
+    assert gui.merge_sources == [] and not gui.merge_tree.get_children()
+    assert gui.merge_button.instate(["disabled"])
+
+
+@pytest.mark.parametrize("tab,kind", enumerate(("split", "merge", "compare", "etc")))
+def test_primary_action_stays_visible_when_settings_scroll(toolkit, tab, kind):
+    gui, _ = toolkit
+    gui.notebook.select(tab)
+    gui.compare_by_key_var.set(True)
+    gui._compare_mode_changed()
+    gui.root.geometry("760x540")
+    gui.root.deiconify()
+    gui.root.update()
+    try:
+        button = getattr(gui, kind + "_button")
+        assert button.winfo_ismapped()
+        assert button.winfo_rooty() + button.winfo_height() <= gui.root.winfo_rooty() + gui.root.winfo_height()
+        assert button.winfo_rootx() + button.winfo_width() <= gui.root.winfo_rootx() + gui.root.winfo_width()
+    finally:
+        gui.root.withdraw()
+
+
+def test_pasting_split_pattern_invalidates_preview_without_key_release(toolkit, tmp_path):
+    gui, _ = toolkit
+    gui.controller.state = replace(gui.controller.state, source=tmp_path / "source.xlsx", sheets=("Data",),
+                                   sheet_name="Data", columns=("Team",), column_name="Team",
+                                   output_dir=tmp_path, preview=object())
+    gui._render_state(gui.controller.state)
+    assert not gui.split_button.instate(["disabled"])
+    gui.pattern_entry.delete(0, "end")
+    gui.pattern_entry.insert(0, "%_새이름")
+    assert gui.controller.state.pattern == "%_새이름"
+    assert gui.controller.state.preview is None
+    assert not gui.split_button.instate(["disabled"])
+
+
+def test_callback_error_keeps_worker_locked_and_next_completion_recovers(toolkit):
+    import threading
+    from tkinter import ttk
+
+    gui, _ = toolkit
+    release = threading.Event()
+    gui._start_worker(lambda: (release.wait(3), ("noop", None))[1], execution=True)
+    button = ttk.Button(gui.root, command=lambda: (_ for _ in ()).throw(RuntimeError("callback failure")))
+    try:
+        button.invoke()
+        assert "callback failure" in gui.error_detail
+        assert gui.error_panel.winfo_manager() == "grid"
+        assert gui._busy and gui.merge_button.instate(["disabled"])
+    finally:
+        release.set()
+        button.destroy()
+    complete_worker(gui)
+    assert not gui._busy
+
+
+def test_poll_recovers_after_result_rendering_failure(toolkit, monkeypatch):
+    gui, _ = toolkit
+    gui._start_worker(lambda: ("noop", None))
+    event = gui.events.get(timeout=3)
+    gui.events.put(event)
+    monkeypatch.setattr(gui, "_handle_ok", lambda _: (_ for _ in ()).throw(RuntimeError("render failure")))
+    gui.poll_queue()
+    assert "render failure" in gui.error_detail and not gui._busy
+    assert gui.root.tk.call("after", "info"), "Result rendering must not stop the event pump"

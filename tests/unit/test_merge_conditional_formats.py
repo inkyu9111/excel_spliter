@@ -201,3 +201,24 @@ def test_utf8_entity_generated_rule_is_not_mistaken_for_no_rule(tmp_path):
     assert cf.restore_full_column_rule(sources, output)
     sheet = minidom.parseString(_parts(output)["xl/worksheets/sheet1.xml"])
     assert sheet.getElementsByTagNameNS(NS, "conditionalFormatting")[0].getAttribute("sqref") == "H1:H1048576"
+
+
+def test_rule_restoration_keeps_large_sheet_data_bytes_outside_the_dom(tmp_path, monkeypatch):
+    from excel_splitter import merge_conditional_formats as cf
+
+    cells = b'<sheetData>' + b'<row><c t="inlineStr"><is><t>data &amp; text</t></is></c></row>' * 10000 + b'</sheetData>'
+    def sheet(scope):
+        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{NS}">'.encode()
+                + cells + f'<conditionalFormatting sqref="{scope}">{RULE}</conditionalFormatting></worksheet>'.encode())
+    sources = tuple(_package(tmp_path / f"part{i}.xlsx", sheet_xml=sheet("H1:H1048576")) for i in range(2))
+    output = _package(tmp_path / "merged.xlsx", sheet_xml=sheet("H6:H7"))
+    parse = cf.minidom.parseString
+    def parse_metadata(xml):
+        assert b"data &amp; text" not in xml, "cell data must not allocate DOM nodes"
+        return parse(xml)
+    monkeypatch.setattr(cf.minidom, "parseString", parse_metadata)
+
+    assert cf.restore_full_column_rule(sources, output)
+    saved = _parts(output)["xl/worksheets/sheet1.xml"]
+    assert cells in saved
+    assert b'sqref="H1:H1048576"' in saved

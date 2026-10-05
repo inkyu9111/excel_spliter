@@ -15,11 +15,10 @@ from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from excel_splitter.errors import WorkbookValidationError
+from excel_splitter.errors import SplitExecutionError, WorkbookValidationError
 from excel_splitter.excel_gateway import ExcelComGateway, _excel_session, _open_workbook
 from excel_splitter.file_signature import capture_signature
 from excel_splitter.merge_service import MergeService
-from excel_splitter.parallel_writer import ParallelWriteAborted
 from excel_splitter.split_service import SplitService
 
 
@@ -134,7 +133,9 @@ def main():
     import win32con
     import win32file
 
-    with TemporaryDirectory(prefix="split-merge-check-") as directory:
+    scratch = Path(__file__).resolve().parents[1] / "build"
+    scratch.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="split-merge-check-", dir=scratch) as directory:
         root = Path(directory) / "한글 경로 공백"
         root.mkdir()
         source = root / "분할 원본.xlsx"
@@ -229,7 +230,7 @@ def main():
                 win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE, None,
                 win32con.OPEN_EXISTING, 0, None)
             try:
-                with rejected(OSError, "기존 대상 파일을 점유하지 못했습니다"):
+                with rejected(SplitExecutionError, "기존 대상 파일을 점유하지 못했습니다"):
                     merge.execute(overwrite_preview, overwrite=True, progress=lambda *_: None)
             finally:
                 handle.Close()
@@ -276,25 +277,22 @@ def main():
             stale = merge.preview((changed, inputs[1]), stale_target)
             with changed.open("ab") as stream:
                 stream.write(b"synthetic stale-preview mutation")
-            with rejected(WorkbookValidationError, "미리보기 이후 변경"):
+            with rejected(WorkbookValidationError, "사전 검사 이후 변경"):
                 merge.execute(stale, overwrite=False, progress=lambda *_: None)
             assert not stale_target.exists()
 
-            checkpoint("known limitation: Split rejects an actively filtered Table")
+            checkpoint("Split includes all rows from an actively filtered Table")
             filtered_dir = root / "필터 제한 점검"
             filtered_dir.mkdir()
             filtered_preview = split.preview(filtered, "분류 표", "지역", "% 분할", filtered_dir)
             assert filtered_preview.snapshot.row_count == 6
-            try:
-                split.execute(filtered_preview, overwrite=False, progress=lambda *_: None)
-            except ParallelWriteAborted as exc:
-                assert "필터링된 범위나 표" in str(exc), str(exc)
-                assert exc.partial_result.failed, exc.partial_result
-                assert set(filtered_dir.iterdir()) == set(exc.partial_result.succeeded), tuple(filtered_dir.iterdir())
-                assert capture_signature(filtered) == originals[filtered]
-                print("KNOWN LIMITATION: filtered Split rejected; original unchanged; temporary files removed", flush=True)
-            else:
-                raise AssertionError("Expected the confirmed active-filter Split rejection; review this limitation")
+            filtered_result = split.execute(filtered_preview, overwrite=False, progress=lambda *_: None)
+            assert not filtered_result.failed, filtered_result
+            assert set(filtered_result.succeeded) == {target.path for target in filtered_preview.targets}
+            assert set(filtered_dir.iterdir()) == set(filtered_result.succeeded)
+            for filtered_target in filtered_preview.targets:
+                check_output(filtered_target.path, GROUPS[filtered_target.label], formulas=True, broken_reference=True)
+            assert capture_signature(filtered) == originals[filtered]
         finally:
             try:
                 split.shutdown()
@@ -307,9 +305,16 @@ def main():
                 )
                 print("PASS: original input SHA-256, size and mtime unchanged (finally)", flush=True)
         checkpoint("temporary output cleanup")
-        expected_files = {*originals, *outputs.values(), target, empty_target, reinput, changed, filtered_dir}
-        assert set(root.iterdir()) == expected_files, tuple(root.iterdir())
-    print("PASS: unfiltered Split -> Merge conservation/order, empty inputs, validation, overwrite, locked outputs, re-input, stale preview, unchanged originals and cleanup; active-filter rejection confirmed separately")
+        expected_paths = {
+            *originals, *outputs.values(), target, empty_target, reinput, changed,
+            filtered_dir, *filtered_result.succeeded,
+        }
+        actual_paths = set(root.rglob("*"))
+        assert actual_paths == expected_paths, {
+            "unexpected": sorted(str(path) for path in actual_paths - expected_paths),
+            "missing": sorted(str(path) for path in expected_paths - actual_paths),
+        }
+    print("PASS: Split -> Merge conservation/order, active-filter Split, empty inputs, validation, overwrite, locked outputs, re-input, stale preview, unchanged originals and cleanup")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from .errors import WorkbookValidationError
 from .models import GroupSummary, OutputTarget
 
 
-_INVALID_CHARACTERS = re.compile(r'[\\/:*?"<>|\[\]]')
+_INVALID_CHARACTERS = re.compile(r'[\x00-\x1f\\/:*?"<>|\[\]]')
 _RESERVED_NAMES = {
     "con",
     "prn",
@@ -32,7 +32,7 @@ def build_targets(
     for group in groups:
         stem = _INVALID_CHARACTERS.sub("_", stem_pattern.replace("%", group.label))
         stem = stem.rstrip(" .")
-        if stem.casefold() in _RESERVED_NAMES:
+        if stem.split(".", 1)[0].rstrip().casefold() in _RESERVED_NAMES:
             stem = f"_{stem}"
         if not stem:
             raise WorkbookValidationError("파일명 패턴의 결과가 비어 있습니다.")

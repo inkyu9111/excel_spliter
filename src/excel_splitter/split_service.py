@@ -63,7 +63,7 @@ class SplitService:
         progress(0, 0, "원본 확인 중")
         if capture_signature(preview.snapshot.source) != preview.snapshot.signature:
             raise WorkbookValidationError(
-                "원본 파일이 미리보기 이후 변경되었습니다."
+                "원본 파일이 사전 검사 이후 변경되었습니다. 작업을 다시 시작하세요."
             )
         if preview.collisions and not overwrite:
             raise WorkbookValidationError("기존 파일 덮어쓰기 승인이 필요합니다.")

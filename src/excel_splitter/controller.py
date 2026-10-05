@@ -73,7 +73,7 @@ class AppController:
     def execute(self, overwrite: bool, progress: ProgressCallback) -> SplitResult:
         preview = self.state.preview
         if preview is None:
-            raise RuntimeError("현재 설정의 미리보기가 필요합니다.")
+            raise RuntimeError("현재 설정의 사전 검사 결과가 없습니다. 작업을 다시 시작하세요.")
         return self._service.execute(preview, overwrite, progress)
 
     def shutdown(self) -> None:

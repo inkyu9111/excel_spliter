@@ -1,10 +1,14 @@
 param(
-    [string]$PythonExe = "C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+    [string]$PythonExe = "",
+    [switch]$SkipTests
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $ProjectRoot
+if (-not $PythonExe) {
+    $PythonExe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+}
 
 $ProjectMarker = Join-Path $ProjectRoot "pyproject.toml"
 $EntryPoint = Join-Path $ProjectRoot "src\excel_splitter\__main__.py"
@@ -31,7 +35,9 @@ Invoke-Checked { & $PythonExe -m pip check } "Dependency verification"
 Invoke-Checked {
     & $PythonExe -c "from importlib.metadata import version; expected={'pywin32':'312','pytest':'8.4.2','pyinstaller':'6.22.2'}; actual={k:version(k) for k in expected}; assert actual == expected, f'Pinned dependency mismatch: {actual}'"
 } "Pinned-version verification"
-Invoke-Checked { & $PythonExe -m pytest tests/unit -q } "Unit tests"
+if (-not $SkipTests) {
+    Invoke-Checked { & $PythonExe -m pytest -q } "Regression tests"
+}
 
 $PythonComDll = (& $PythonExe -c "import pythoncom; print(pythoncom.__file__)").Trim()
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $PythonComDll -PathType Leaf)) {
@@ -41,34 +47,6 @@ if ([System.IO.Path]::GetFileName($PythonComDll) -notmatch '^pythoncom\d+\.dll$'
     throw "Unexpected pythoncom native DLL name: $PythonComDll"
 }
 $PythonComBinary = "$PythonComDll;pywin32_system32"
-
-Invoke-Checked {
-    & $PythonExe -m PyInstaller --noconfirm --clean --onedir --windowed `
-        --name ExcelFileToolkit --paths src --add-binary $PythonComBinary `
-        --icon $AppIcon --add-data "$AppIcon;excel_splitter/assets" `
-        --workpath build\toolkit-onedir --distpath build\toolkit-preview `
-        src/excel_splitter/__main__.py
-} "One-folder build"
-
-$OnedirPath = (Join-Path $ProjectRoot "build\toolkit-preview\ExcelFileToolkit")
-$OnedirExe = Join-Path $OnedirPath "ExcelFileToolkit.exe"
-if (-not (Test-Path -LiteralPath $OnedirExe -PathType Leaf)) {
-    throw "One-folder executable was not created: $OnedirExe"
-}
-$OnedirPythonCom = Get-ChildItem -LiteralPath $OnedirPath -Recurse -File `
-    -Filter "pythoncom*.dll"
-if (-not $OnedirPythonCom) {
-    throw "One-folder build omitted the pythoncom native DLL."
-}
-$Probe = Start-Process -FilePath $OnedirExe -WindowStyle Hidden -PassThru
-Start-Sleep -Seconds 2
-if ($Probe.HasExited) {
-    throw "One-folder executable exited during startup verification."
-}
-$Probe.CloseMainWindow() | Out-Null
-if (-not $Probe.WaitForExit(3000)) {
-    Stop-Process -Id $Probe.Id
-}
 
 Invoke-Checked {
     & $PythonExe -m PyInstaller --noconfirm --clean --onefile --windowed `
@@ -102,6 +80,6 @@ if ($SelfTest.ExitCode -ne 0) {
     throw "Final executable could not import pythoncom/win32com (exit $($SelfTest.ExitCode))."
 }
 Invoke-Checked {
-    & $PythonExe scripts/check_executable_icon.py $OnedirExe $FinalExe
+    & $PythonExe scripts/check_executable_icon.py $FinalExe
 } "Executable and window icon verification"
 Write-Host "Built: $FinalExe"

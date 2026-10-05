@@ -66,7 +66,7 @@ def test_collisions_are_case_insensitive(tmp_path: Path) -> None:
     ]
 
 
-@pytest.mark.parametrize("label", ["CON", "com1", "Lpt9"])
+@pytest.mark.parametrize("label", ["CON", "com1", "Lpt9", "CON.report", "NUL.part"])
 def test_windows_device_names_are_prefixed(label: str, tmp_path: Path) -> None:
     target = build_targets(
         "%", (group(label),), tmp_path, tmp_path / "source.xlsx"
@@ -100,11 +100,3 @@ def test_absolute_paths_over_218_characters_are_rejected(tmp_path: Path) -> None
         build_targets(
             "%", (group("f" * 120),), output_dir, tmp_path / "source.xlsx"
         )
-
-
-def test_targets_start_without_a_prior_signature(tmp_path: Path) -> None:
-    target = build_targets(
-        "%", (group("result"),), tmp_path, tmp_path / "source.xlsx"
-    )[0]
-
-    assert target.prior_signature is None

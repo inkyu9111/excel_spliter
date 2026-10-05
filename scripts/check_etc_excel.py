@@ -3,6 +3,8 @@
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from xml.etree import ElementTree
+from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -79,7 +81,16 @@ def main() -> None:
                 book.Close(SaveChanges=False)
         signature = capture_signature(source)
         service = EtcService()
-        assert service.inspect_source(source) == ("Selected", "Other")
+        with ZipFile(source) as package:
+            workbook_xml = ElementTree.fromstring(package.read("xl/workbook.xml"))
+        stored_names = tuple(item.attrib["name"] for item in workbook_xml.findall(
+            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheets/"
+            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"
+        ))
+        actual_names = service.inspect_source(source)
+        print(f"SHEETS: persisted={stored_names!r}; Excel={actual_names!r}", flush=True)
+        assert len(stored_names) == 2 and set(stored_names) == {"Selected", "Other"}
+        assert actual_names == stored_names, (actual_names, stored_names)
         outputs = []
         for remove_artifacts, reset_fill, exclude_headers, remove_conditional_formats in (
             (True, False, True, False), (False, True, True, False),

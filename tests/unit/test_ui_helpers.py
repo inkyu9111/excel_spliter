@@ -66,3 +66,10 @@ def test_error_summary_keeps_validation_context_and_hides_raw_com_tuple() -> Non
     assert "Excel" in summary and action
     summary, action = describe_error(ExcelUnavailableError("pywin32를 불러올 수 없습니다."))
     assert summary and action
+
+
+def test_merge_validation_advice_names_the_actual_problem() -> None:
+    _, duplicate = describe_error(WorkbookValidationError("같은 원본 파일을 중복 선택할 수 없습니다."))
+    assert "한 번" in duplicate and "키" not in duplicate
+    _, columns = describe_error(WorkbookValidationError("Table 열 이름과 순서가 다릅니다: source.xlsx"))
+    assert "열 순서" in columns and "키" not in columns
