@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from .compare_service import CompareService
 from .controller import AppController
@@ -30,6 +30,12 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._merge_after_preview = False
         self.source_name_labels = {}
         self._progress_variables = []
+        self._pages = {}
+        self._edit_areas = {}
+        self._save_rows = {}
+        self._result_visible = set()
+        self.result_summaries = {}
+        self.result_back_buttons = {}
         super().__init__(root, controller)
         self.merge_output_var.trace_add("write", self._merge_output_changed)
         self.compare_output_var.trace_add("write", self._compare_output_changed)
@@ -41,326 +47,390 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
     def _build(self) -> None:
         self.root.title("Excel File Toolkit · 파일 작업")
         self.root.iconbitmap(str(Path(__file__).with_name("assets") / "app.ico"))
-        self.root.geometry("900x680")
-        self.root.minsize(760, 540)
+        self.root.geometry("900x600")
+        self.root.minsize(900, 600)
         self.root.option_add("*Font", ("맑은 고딕", 10))
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        self.root.configure(background="#f4f5f7")
-        style.configure(".", font=("맑은 고딕", 10), background="#ffffff", foreground="#17202b")
-        style.configure("Shell.TFrame", background="#f4f5f7")
-        style.configure("Shell.TLabel", background="#f4f5f7", foreground="#64748b")
+        self.root.configure(background="#f4f6f9")
+        style.configure(".", font=("맑은 고딕", 10), background="#ffffff", foreground="#1d2735")
         style.configure("TFrame", background="#ffffff")
-        style.configure("TFrame", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3")
         style.configure("TLabel", background="#ffffff")
-        style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=3)
-        style.map("TEntry", fieldbackground=[("readonly", "#f7f9fa")])
-        style.configure("TCombobox", fieldbackground="#ffffff", background="#f7f9fa", bordercolor="#d5dde3", lightcolor="#d5dde3", darkcolor="#d5dde3", padding=3)
+        style.configure("Shell.TFrame", background="#f4f6f9")
+        style.configure("Shell.TLabel", background="#f4f6f9", foreground="#627086")
+        style.configure("Note.TLabel", foreground="#627086")
+        style.configure("Title.TLabel", font=("맑은 고딕", 12, "bold"))
+        style.configure("TButton", padding=(10, 5), background="#ffffff", bordercolor="#dce2eb")
+        style.configure("Nav.TButton", padding=(18, 8), borderwidth=0)
+        style.configure("Selected.Nav.TButton", background="#edf3fc", foreground="#1b60bc")
+        style.configure("Primary.TButton", background="#1b60bc", foreground="white", padding=(18, 10))
+        style.map("Primary.TButton", background=[("disabled", "#e4eaf0"), ("active", "#164f9a")],
+                  foreground=[("disabled", "#718096")])
+        style.configure("TEntry", padding=4, fieldbackground="#ffffff", bordercolor="#dce2eb")
+        style.map("TEntry", fieldbackground=[("readonly", "#f4f6f9")])
+        style.configure("TCombobox", padding=4, fieldbackground="#ffffff", bordercolor="#dce2eb")
         style.map("TCombobox", fieldbackground=[("readonly", "#ffffff")])
-        style.configure("Horizontal.TProgressbar", troughcolor="#eef2f1", background="#18754c", bordercolor="#eef2f1", lightcolor="#18754c", darkcolor="#18754c")
-        style.configure("TButton", padding=(10, 5), background="#ffffff")
-        style.configure("Primary.TButton", background="#1266ad", foreground="white", padding=(16, 7))
-        style.map("Primary.TButton", background=[("disabled", "#e4eaf0"), ("active", "#0c508a")],
-                  foreground=[("disabled", "#718279")])
-        style.configure("TNotebook", background="#f4f5f7", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(18, 8))
-        style.map("TNotebook.Tab", padding=[("selected", (18, 8)), ("!selected", (18, 8))],
-                  background=[("selected", "#ffffff"), ("!selected", "#e9edf2")], foreground=[("selected", "#1266ad")])
-        style.configure("Treeview", rowheight=30, fieldbackground="#ffffff", bordercolor="#d5dde3")
-        style.map("Treeview", background=[("selected", "#1266ad")], foreground=[("selected", "white")])
-        style.configure("Treeview.Heading", padding=5, background="#f3f6f8")
-        style.configure("Section.TLabel", font=("맑은 고딕", 11, "bold"))
-        style.configure("Note.TLabel", foreground="#64788a")
-        header = ttk.Frame(self.root, padding=(12, 10), style="Shell.TFrame")
-        header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="Excel 파일 도구", font=("맑은 고딕", 13, "bold"), style="Shell.TLabel",
-                  foreground="#17202b").pack(side="left")
-        ttk.Button(header, text="로그 보기", command=self._show_log).pack(side="right")
-        ttk.Label(header, text="원본 보존 · 검증 후 결과 저장", style="Shell.TLabel").pack(side="right", padx=12)
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        style.configure("Treeview", rowheight=32, fieldbackground="#ffffff", bordercolor="#dce2eb")
+        style.configure("Treeview.Heading", padding=(8, 6), background="#f4f6f9", foreground="#627086")
+        style.map("Treeview", background=[("selected", "#edf3fc")], foreground=[("selected", "#1b60bc")])
+        style.configure("Horizontal.TProgressbar", troughcolor="#e7ecf3", background="#1b60bc", thickness=5)
+        style.configure("Workspace.TNotebook", borderwidth=0, tabmargins=0)
+        style.layout("Workspace.TNotebook.Tab", [])
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
-        split_page = self._page("파일 분할")
-        self._build_split_page(split_page)
+        self.root.rowconfigure(2, weight=1)
+        header = ttk.Frame(self.root, padding=(16, 7), style="Shell.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="Excel 도구", style="Shell.TLabel", foreground="#1d2735",
+                  font=("맑은 고딕", 11, "bold")).pack(side="left")
+        ttk.Label(header, text="원본 보존 · 검증 후 결과 저장", style="Shell.TLabel").pack(side="right")
+        nav = ttk.Frame(self.root, padding=(10, 4))
+        nav.grid(row=1, column=0, sticky="ew")
+        self.notebook = ttk.Notebook(self.root, style="Workspace.TNotebook")
+        self.notebook.grid(row=2, column=0, sticky="nsew")
+        self.nav_buttons = {}
+        for kind, label, index in (("merge", "병합", 1), ("split", "분할", 0), ("compare", "비교", 2), ("etc", "시트 정리", 3)):
+            button = ttk.Button(nav, text=label, style="Nav.TButton", command=lambda i=index: self.notebook.select(i))
+            button.pack(side="left", padx=(0, 4))
+            self.nav_buttons[kind] = button
+            self._input_widgets.append(button)
+        ttk.Button(nav, text="로그", command=self._show_log).pack(side="right")
+        self._build_split_page(self._page("분할", "split"))
         self._build_merge()
         self._build_compare()
         self._build_etc()
         self._build_error_panel()
-        self._render_compare_state()
+        self.notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
         self.notebook.select(1)
+        self._tab_changed()
 
-    def _page(self, title: str):
+    def _tab_changed(self, _event=None):
+        current = self.notebook.index(self.notebook.select())
+        for index, kind in enumerate(("split", "merge", "compare", "etc")):
+            self.nav_buttons[kind].configure(style="Selected.Nav.TButton" if index == current else "Nav.TButton")
+
+    def _page(self, title: str, kind: str):
         outer = ttk.Frame(self.notebook)
         self.notebook.add(outer, text=title)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
-        canvas = tk.Canvas(outer, highlightthickness=0, background="#f4f5f7")
-        canvas.grid(row=0, column=0, sticky="nsew")
-        bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        bar.grid(row=0, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=bar.set)
-        page = ttk.Frame(canvas, padding=(0, 10, 0, 4), style="Shell.TFrame")
-        window = canvas.create_window(0, 0, window=page, anchor="nw")
-        page.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
-        # Scroll only the active page; list/table widgets retain their own wheel behavior.
-        def wheel(event):
-            if self.notebook.select() == str(outer) and not isinstance(event.widget, (tk.Listbox, ttk.Treeview)):
-                if page.winfo_height() > canvas.winfo_height():
-                    canvas.yview_scroll(-int(event.delta / 120), "units")
-        self.root.bind("<MouseWheel>", wheel, add="+")
-        page.columnconfigure(0, weight=1)
-        return page
+        workspace = ttk.Frame(outer)
+        workspace.grid(row=0, column=0, sticky="nsew")
+        workspace.columnconfigure(0, weight=1)
+        workspace.rowconfigure(0, weight=1)
+        editor = ttk.Frame(workspace)
+        editor.grid(row=0, column=0, sticky="nsew")
+        editor.columnconfigure(0, weight=1)
+        editor.rowconfigure(2, weight=1)
+        self._pages[kind] = outer
+        self._edit_areas[kind] = editor
+        return editor
 
-    def _section(self, page, row: int, title: str):
-        section = ttk.Frame(page, padding=(12, 8), relief="solid", borderwidth=1)
-        section.grid(row=row, column=0, sticky="ew", pady=(0, 8))
-        section.columnconfigure(0, weight=1)
-        ttk.Label(section, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(2, 5))
-        body = ttk.Frame(section)
-        body.grid(row=1, column=0, sticky="ew")
-        body.columnconfigure(0, weight=1)
-        return body
+    def _ribbon(self, page):
+        ribbon = ttk.Frame(page, padding=(16, 10), style="Shell.TFrame")
+        ribbon.grid(row=0, column=0, sticky="ew")
+        return ribbon
 
-    def _wrapped_label(self, parent, **options):
-        label = ttk.Label(parent, width=1, justify="left", **options)
-        label.bind("<Configure>", lambda event: label.configure(wraplength=max(1, event.width)))
-        return label
+    def _field(self, parent, column: int, title: str):
+        parent.columnconfigure(column, weight=1, uniform="settings")
+        field = ttk.Frame(parent, style="Shell.TFrame")
+        field.grid(row=0, column=column, sticky="ew", padx=(0, 12))
+        field.columnconfigure(0, weight=1)
+        ttk.Label(field, text=title, style="Shell.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        return field
 
     def _path_row(self, parent, variable, action, label="", readonly=False):
         row = ttk.Frame(parent)
-        row.grid(sticky="ew", pady=4)
+        row.grid(sticky="ew")
         row.columnconfigure(0, weight=1)
         caption = ttk.Frame(row)
-        caption.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 3))
+        caption.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
         caption.columnconfigure(1, weight=1)
-        if label:
-            ttk.Label(caption, text=label).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(caption, text=label, style="Note.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10))
         if readonly:
-            name = self._wrapped_label(caption, font=("맑은 고딕", 10, "bold"), anchor="e")
+            name = ttk.Label(caption, width=1, anchor="e", font=("맑은 고딕", 10, "bold"))
             name.grid(row=0, column=1, sticky="ew")
             self.source_name_labels[str(variable)] = name
-            variable.trace_add("write", lambda *_: name.configure(text=Path(variable.get()).name if variable.get() else ""))
-        entry = ttk.Entry(row, textvariable=variable, state="readonly" if readonly else "normal")
-        entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=2)
-        button = ttk.Button(row, text="찾아보기", command=action)
-        button.grid(row=1, column=2)
-        full_path = self._wrapped_label(row, textvariable=variable, style="Note.TLabel")
-        path_font = tkfont.Font(root=self.root, font=entry.cget("font"))
-
-        def show_full_path(*_):
-            if variable.get() and path_font.measure(variable.get()) > entry.winfo_width() - 12:
-                full_path.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-            else:
-                full_path.grid_remove()
-
-        variable.trace_add("write", show_full_path)
-        entry.bind("<Configure>", show_full_path)
-        self._input_widgets.append(button)
+            variable.trace_add("write", lambda *_: name.configure(text=Path(variable.get()).name if variable.get() else "선택한 파일 없음"))
+        entry = ttk.Entry(row, textvariable=variable, state="readonly" if readonly else "normal", width=1)
+        entry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        browse = ttk.Button(row, text="찾아보기", command=action)
+        browse.grid(row=1, column=1)
+        ttk.Button(row, text="경로", command=lambda: self._show_text("전체 경로", variable.get() or "선택한 경로가 없습니다.")).grid(row=1, column=2, padx=(6, 0))
+        entry.bind("<Double-1>", lambda _: self._show_text("전체 경로", variable.get()))
+        self._input_widgets.append(browse)
         if not readonly:
             self._input_widgets.append(entry)
         return entry, row
 
-    def _output_section(self, page, kind, variable, action):
-        body = self._section(page, 2, "3   저장 위치")
-        entry, row = self._path_row(body, variable, action, "결과 파일")
-        recommend = ttk.Button(row, text="새 파일명 추천", command=lambda: self._recommend_output(kind))
-        recommend.grid(row=1, column=1, padx=(0, 8))
-        self._input_widgets.append(recommend)
-        note = tk.StringVar()
-        setattr(self, kind + "_path_note", note)
-        self._wrapped_label(body, textvariable=note, style="Note.TLabel").grid(sticky="ew", pady=(4, 0))
-        setattr(self, kind + "_output_entry", entry)
+    def _tree(self, parent, columns, *, selectmode="browse"):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(parent, columns=tuple(item[0] for item in columns), show="headings", height=1, selectmode=selectmode)
+        for name, title, width in columns:
+            tree.heading(name, text=title, anchor="w")
+            tree.column(name, width=width, minwidth=65, stretch=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        return tree
 
-    def _work_footer(self, page, kind, text, action):
-        # Keep progress and the next action visible even when settings scroll.
-        footer = ttk.Frame(page.master.master, padding=(12, 10))
-        footer.grid(row=1, column=0, columnspan=2, sticky="ew")
+    def _work_footer(self, page, kind, text, action, variable, browse):
+        footer = ttk.Frame(self._pages[kind], padding=(16, 9), style="Shell.TFrame")
+        footer.grid(row=1, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
-        status = tk.StringVar(value="파일과 작업 설정을 확인하세요.")
-        reason = tk.StringVar()
+        save = ttk.Frame(footer, style="Shell.TFrame")
+        save.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        save.columnconfigure(1, weight=1)
+        ttk.Label(save, text="출력 폴더" if kind == "split" else "저장할 파일", style="Shell.TLabel").grid(row=0, column=0, padx=(0, 9))
+        entry = ttk.Entry(save, textvariable=variable, width=1)
+        entry.grid(row=0, column=1, sticky="ew")
+        entry.bind("<Double-1>", lambda _: self._show_text("저장 경로", variable.get()))
+        choose = ttk.Button(save, text="찾아보기", command=browse)
+        choose.grid(row=0, column=2, padx=(6, 0))
+        self._input_widgets.extend((entry, choose))
+        if kind != "split":
+            recommend = ttk.Button(save, text="새 이름", command=lambda: self._recommend_output(kind))
+            recommend.grid(row=0, column=3, padx=(6, 0))
+            self._input_widgets.append(recommend)
+        self._save_rows[kind] = save
+        setattr(self, "output_entry" if kind == "split" else kind + "_output_entry", entry)
+        status, reason, note = tk.StringVar(value="시작하면 자동 검사 후 실행합니다."), tk.StringVar(), tk.StringVar()
         setattr(self, kind + "_status_var", status)
         setattr(self, kind + "_reason_var", reason)
-        variable = tk.DoubleVar(value=0)
-        self._progress_variables.append(variable)
-        progress = ttk.Progressbar(footer, variable=variable, maximum=1)
-        progress.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        setattr(self, kind + "_path_note", note)
+        status_label = ttk.Label(footer, width=1, style="Shell.TLabel")
+        status_label.grid(row=2, column=0, sticky="ew", padx=(0, 12), pady=(4, 0))
+        def update_status(*_):
+            value = status.get() if self._busy or kind in self._result_visible else reason.get() or status.get()
+            status_label.configure(text=value.splitlines()[0] if value else "")
+        status.trace_add("write", update_status)
+        reason.trace_add("write", update_status)
+        update_status()
+        status_label.bind("<Double-1>", lambda _: self._show_text("작업 상태", "\n\n".join(value.get() for value in (status, reason, note) if value.get())))
+        progress_var = tk.DoubleVar(value=0)
+        self._progress_variables.append(progress_var)
+        progress = ttk.Progressbar(footer, variable=progress_var, maximum=1)
+        progress.grid(row=1, column=0, sticky="ew", padx=(0, 12), pady=(7, 0))
         setattr(self, kind + "_progress", progress)
-        self._wrapped_label(footer, textvariable=status, style="Note.TLabel").grid(row=1, column=0, sticky="ew")
-        self._wrapped_label(footer, textvariable=reason, style="Note.TLabel").grid(row=2, column=0, sticky="ew")
-        button = ttk.Button(footer, text=text, command=action, style="Primary.TButton")
-        button.grid(row=1, column=2, rowspan=2)
+        button = ttk.Button(footer, text=text, style="Primary.TButton", command=lambda: self._show_editor(kind) if kind in self._result_visible else action())
+        button.grid(row=0, column=1, rowspan=3, sticky="ns")
         self._input_widgets.append(button)
         setattr(self, kind + "_button", button)
         self._build_result_panel(page, kind)
 
     def _build_result_panel(self, page, kind):
-        frame = ttk.Frame(page, padding=12, relief="solid", borderwidth=1)
-        frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        frame = ttk.Frame(page.master, padding=(16, 12))
+        frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        label = self._wrapped_label(frame, font=("맑은 고딕", 10, "bold"))
-        label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        table = ttk.Frame(frame)
-        table.grid(row=1, column=0, sticky="ew")
-        table.columnconfigure(0, weight=1)
-        tree = ttk.Treeview(table, columns=("kind", "location", "column", "reference", "comparison"), show="headings", height=6)
-        for name, heading, width in zip(tree["columns"], ("구분", "시트 · 키 / 위치", "열", "기준 파일", "대상 파일"), (90, 220, 130, 190, 190)):
-            tree.heading(name, text=heading)
-            tree.column(name, width=width, minwidth=60)
-        tree.grid(row=0, column=0, sticky="ew")
-        bar = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
-        bar.grid(row=0, column=1, sticky="ns")
-        hbar = ttk.Scrollbar(table, orient="horizontal", command=tree.xview)
-        hbar.grid(row=1, column=0, sticky="ew")
-        tree.configure(yscrollcommand=bar.set, xscrollcommand=hbar.set)
-        tree.bind("<Double-1>", lambda _: self._show_result_detail(kind))
+        frame.rowconfigure(2, weight=1)
+        label = ttk.Label(frame, width=1, style="Title.TLabel")
+        label.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         actions = ttk.Frame(frame)
-        actions.grid(row=2, column=0, sticky="e", pady=(10, 0))
+        actions.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         buttons = []
-        for i, (label_text, action) in enumerate((
-            ("선택 결과 열기" if kind == "split" else "결과 파일 열기", lambda: self._open_result(kind)),
-            ("결과 폴더 열기", lambda: self._open_result(kind, folder=True)),
-        )):
-            button = ttk.Button(actions, text=label_text, command=action)
-            button.grid(row=0, column=i, padx=(6, 0))
+        for title, action in (("선택 결과 열기" if kind == "split" else "결과 열기", lambda: self._open_result(kind)),
+                              ("폴더 열기", lambda: self._open_result(kind, folder=True))):
+            button = ttk.Button(actions, text=title, command=action)
+            button.pack(side="left", padx=(0, 6))
             buttons.append(button)
         if kind == "merge":
-            button = ttk.Button(actions, text="이 결과 비교하기", command=self._use_merge_for_compare)
-            button.grid(row=0, column=2, padx=(6, 0))
+            button = ttk.Button(actions, text="이 결과 비교", command=self._use_merge_for_compare)
+            button.pack(side="left", padx=(0, 6))
             buttons.append(button)
-        ttk.Button(actions, text="설정으로 돌아가기", command=lambda: page.master.yview_moveto(0)).grid(
-            row=0, column=2 if kind in ("split", "compare") else 3, padx=(6, 0))
-        if kind in ("split", "compare"):
-            ttk.Button(actions, text="선택 내역 상세 보기", command=lambda: self._show_result_detail(kind)).grid(
-                row=0, column=3, padx=(6, 0))
-        self._input_widgets.extend(buttons)
+        back = ttk.Button(actions, text="설정으로 돌아가기", command=lambda: self._show_editor(kind))
+        back.pack(side="right")
+        self.result_back_buttons[kind] = back
+        ttk.Button(actions, text="전체 요약", command=lambda: self._show_text("작업 결과", self.result_summaries.get(kind, ""))).pack(side="right", padx=6)
+        ttk.Button(actions, text="선택 상세", command=lambda: self._show_result_detail(kind)).pack(side="right")
+        table = ttk.Frame(frame)
+        table.grid(row=2, column=0, sticky="nsew")
+        tree = self._tree(table, (("kind", "구분", 80), ("location", "시트 · 키 / 위치", 190),
+                                  ("column", "열", 110), ("reference", "기준 파일", 170), ("comparison", "대상 파일", 170)))
+        if kind != "compare":
+            tree.configure(displaycolumns=("kind", "location", "comparison"))
+            tree.heading("location", text="결과 파일")
+            tree.heading("comparison", text="저장 경로 / 오류")
+        tree.bind("<Double-1>", lambda _: self._show_result_detail(kind))
+        self._input_widgets.extend((*buttons, back))
         self.result_panels[kind] = (frame, label, tree, buttons)
         frame.grid_remove()
 
+    def _show_editor(self, kind):
+        if self._busy:
+            return
+        self._result_visible.discard(kind)
+        self.result_panels[kind][0].grid_remove()
+        self._edit_areas[kind].grid()
+        self._save_rows[kind].grid()
+        getattr(self, kind + "_button").configure(text={"split": "분할 시작", "merge": "병합 시작", "compare": "비교 시작", "etc": "정리 시작"}[kind])
+        self._render_state(self.controller.state)
+        self._render_merge_state()
+        self._render_compare_state()
+        self._render_etc_state()
+
+    def _render_state(self, state):
+        super()._render_state(state)
+        if "split" in self._result_visible and not self._busy:
+            self.split_button.configure(state="normal")
+
     def _build_split_page(self, page):
-        body = self._section(page, 0, "1   파일")
-        self.source_entry, _ = self._path_row(body, self.source_var, self._browse_source, "원본 파일", readonly=True)
-        body = self._section(page, 1, "2   작업 설정")
-        options = ttk.Frame(body)
-        options.grid(sticky="ew")
-        options.columnconfigure((0, 1), weight=1)
-        ttk.Label(options, text="워크시트").grid(row=0, column=0, sticky="w")
-        ttk.Label(options, text="분류 컬럼").grid(row=0, column=1, sticky="w", padx=(12, 0))
-        self.sheet_combo = ttk.Combobox(options, textvariable=self.sheet_var, state="readonly")
-        self.sheet_combo.grid(row=1, column=0, sticky="ew", pady=5)
-        self.column_combo = ttk.Combobox(options, textvariable=self.column_var, state="readonly")
-        self.column_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=5)
+        ribbon = self._ribbon(page)
+        self.sheet_combo = ttk.Combobox(self._field(ribbon, 0, "워크시트"), textvariable=self.sheet_var, state="disabled", width=1)
+        self.column_combo = ttk.Combobox(self._field(ribbon, 1, "분류 열"), textvariable=self.column_var, state="disabled", width=1)
+        self.pattern_entry = ttk.Entry(self._field(ribbon, 2, "파일명 패턴 · % = 분류값"), textvariable=self.pattern_var, width=1)
+        for widget in (self.sheet_combo, self.column_combo, self.pattern_entry):
+            widget.grid(row=1, column=0, sticky="ew")
         self.sheet_combo.bind("<<ComboboxSelected>>", self._select_sheet)
         self.column_combo.bind("<<ComboboxSelected>>", self._select_column)
-        ttk.Label(body, text="파일명 패턴 · %는 분류값으로 바뀝니다", style="Note.TLabel").grid(sticky="w", pady=(8, 4))
-        self.pattern_entry = ttk.Entry(body, textvariable=self.pattern_var)
-        self.pattern_entry.grid(sticky="ew", ipady=2)
-        self._input_widgets.extend((self.sheet_combo, self.column_combo, self.pattern_entry))
-        body = self._section(page, 2, "3   저장 위치")
-        self.output_entry, _ = self._path_row(body, self.output_var, self._browse_output, "출력 폴더")
-        self.split_path_note = tk.StringVar()
-        self._wrapped_label(body, textvariable=self.split_path_note, style="Note.TLabel").grid(sticky="ew")
-        preview_frame = ttk.Frame(body)
-        preview_frame.grid(sticky="ew", pady=(10, 0))
-        preview_frame.columnconfigure(0, weight=1)
-        self.preview_tree = ttk.Treeview(preview_frame, columns=("label", "count", "filename"), show="headings", height=4)
-        for col, title, width in (("label", "분류", 180), ("count", "행 수", 80), ("filename", "출력 파일", 560)):
-            self.preview_tree.heading(col, text=title)
-            self.preview_tree.column(col, width=width)
-        self.preview_tree.grid(row=0, column=0, sticky="ew")
-        bar = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_tree.yview)
-        bar.grid(row=0, column=1, sticky="ns")
-        self.preview_tree.configure(yscrollcommand=bar.set)
-        preview_frame.grid_remove()
-        self._work_footer(page, "split", "분할 시작", self._split)
-        self.progress = self.split_progress
-        self.status_var = self.split_status_var
+        self.split_office_prefix_var = tk.BooleanVar(value=False)
+        self.split_office_prefix_checkbox = ttk.Checkbutton(ribbon, text="사업소 순서 접두사 (01_~15_)",
+            variable=self.split_office_prefix_var, command=self._office_prefix_changed, state="disabled")
+        self.split_office_prefix_checkbox.grid(row=1, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        self.split_office_note = tk.StringVar(value="선택 열이 기준 15개 사업소와 모두 일치할 때 사용")
+        ttk.Label(ribbon, textvariable=self.split_office_note, style="Shell.TLabel", width=1).grid(row=1, column=2, sticky="ew", pady=(9, 0))
+        source = ttk.Frame(page, padding=(16, 12))
+        source.grid(row=1, column=0, sticky="ew")
+        source.columnconfigure(0, weight=1)
+        self.source_entry, _ = self._path_row(source, self.source_var, self._browse_source, "원본 파일", readonly=True)
+        table = ttk.Frame(page, padding=(16, 0, 16, 12))
+        table.grid(row=2, column=0, sticky="nsew")
+        self.preview_tree = self._tree(table, (("label", "분류", 180), ("count", "행 수", 90), ("filename", "출력 파일", 490)))
+        self._input_widgets.extend((self.sheet_combo, self.column_combo, self.pattern_entry, self.split_office_prefix_checkbox))
+        self._work_footer(page, "split", "분할 시작", self._split, self.output_var, self._browse_output)
+        self.progress, self.status_var = self.split_progress, self.split_status_var
 
     def _build_merge(self):
-        page = self._page("파일 병합")
-        body = self._section(page, 0, "1   병합할 파일")
-        actions = ttk.Frame(body)
-        actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        page = self._page("병합", "merge")
+        actions = ttk.Frame(page, padding=(16, 10))
+        actions.grid(row=0, column=0, sticky="ew")
         self.merge_list_buttons = []
-        for i, (label, action) in enumerate((("파일 추가", self._add_merge_files), ("선택 제거", self._remove_merge_file),
-                                            ("목록 비우기", self._clear_merge_files),
-                                            ("위로", lambda: self._move_merge_file(-1)), ("아래로", lambda: self._move_merge_file(1)))):
-            button = ttk.Button(actions, text=label, command=action)
-            button.grid(row=0, column=i, padx=(0, 6))
-            self._input_widgets.append(button)
+        for index, (label, action) in enumerate((("파일 추가", self._add_merge_files), ("선택 제거", self._remove_merge_file),
+                                                ("목록 비우기", self._clear_merge_files),
+                                                ("↑", lambda: self._move_merge_file(-1)), ("↓", lambda: self._move_merge_file(1)))):
+            button = ttk.Button(actions, text=label, command=action, width=3 if index > 2 else None)
+            button.grid(row=0, column=index, padx=(0, 6))
             self.merge_list_buttons.append(button)
+            self._input_widgets.append(button)
         actions.columnconfigure(5, weight=1)
         self.merge_count_var = tk.StringVar(value="파일 0개")
         ttk.Label(actions, textvariable=self.merge_count_var, style="Note.TLabel").grid(row=0, column=5, sticky="e")
-        self.merge_tree = ttk.Treeview(body, columns=("path", "sheet", "rows", "status"), show="headings", height=6, selectmode="extended")
-        for col, title, width in (("path", "파일 이름 · 위에서 아래 순서로 병합", 390), ("sheet", "시트", 130), ("rows", "데이터 행", 90), ("status", "상태", 110)):
-            self.merge_tree.heading(col, text=title, anchor="w")
-            self.merge_tree.column(col, width=width, minwidth=70, stretch=col == "path", anchor="e" if col == "rows" else "w")
-        self.merge_tree.grid(row=1, column=0, sticky="ew")
-        bar = ttk.Scrollbar(body, orient="vertical", command=self.merge_tree.yview)
-        bar.grid(row=1, column=1, sticky="ns")
-        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.merge_tree.xview)
-        hbar.grid(row=2, column=0, sticky="ew")
-        self.merge_tree.configure(yscrollcommand=bar.set, xscrollcommand=hbar.set)
+        ttk.Label(page, text="목록 순서로 병합 · 첫 파일의 서식 사용 · 표 본문 수식은 계산값으로 저장", style="Note.TLabel").grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+        table = ttk.Frame(page, padding=(16, 0, 16, 12))
+        table.grid(row=2, column=0, sticky="nsew")
+        self.merge_tree = self._tree(table, (("path", "파일 이름 · 위에서 아래 순서로 병합", 420), ("sheet", "시트", 140),
+                                              ("rows", "데이터 행", 100), ("status", "상태", 120)), selectmode="extended")
         self.merge_selected_path_var = tk.StringVar()
-        self._wrapped_label(body, textvariable=self.merge_selected_path_var, style="Note.TLabel").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        pathbar = ttk.Frame(table)
+        pathbar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        pathbar.columnconfigure(0, weight=1)
+        path = ttk.Label(pathbar, textvariable=self.merge_selected_path_var, width=1, style="Note.TLabel")
+        path.grid(row=0, column=0, sticky="ew")
+        ttk.Button(pathbar, text="경로", command=lambda: self._show_text("선택한 파일 경로", self.merge_selected_path_var.get())).grid(row=0, column=1)
         self.merge_tree.bind("<<TreeviewSelect>>", self._merge_selection_changed)
         self.merge_tree.bind("<Delete>", lambda _: self._remove_merge_file())
-        body = self._section(page, 1, "2   병합 방식")
-        self._wrapped_label(body, text="같은 열 이름·순서의 Excel 표(Table)를 합칩니다. 첫 파일의 서식을 사용하고 표 데이터 본문 수식은 현재 계산값으로 저장합니다.",
-                            style="Note.TLabel").grid(sticky="ew")
+        self.merge_tree.bind("<Double-1>", lambda _: self._show_text("선택한 파일 경로", self.merge_selected_path_var.get()))
         self.merge_output_var = tk.StringVar()
-        self._output_section(page, "merge", self.merge_output_var, self._browse_merge_output)
-        self._work_footer(page, "merge", "병합 시작", self._merge)
+        self._work_footer(page, "merge", "병합 시작", self._merge, self.merge_output_var, self._browse_merge_output)
 
-    def _build_etc(self) -> None:
-        page = self._page("시트 정리")
+    def _build_compare(self):
+        page = self._page("비교", "compare")
+        self.compare_reference_var, self.compare_comparison_var, self.compare_output_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.compare_by_key_var = tk.BooleanVar(value=False)
+        ribbon = self._ribbon(page)
+        mode = self._field(ribbon, 0, "비교 방식")
+        self.compare_position_radio = ttk.Radiobutton(mode, text="셀 위치", variable=self.compare_by_key_var, value=False, command=self._compare_mode_changed)
+        self.compare_key_radio = ttk.Radiobutton(mode, text="키가 같은 행", variable=self.compare_by_key_var, value=True, command=self._compare_mode_changed)
+        self.compare_position_radio.grid(row=1, column=0, sticky="w")
+        self.compare_key_radio.grid(row=1, column=1, sticky="w", padx=(10, 0))
+        self.compare_reference_table_combo = ttk.Combobox(self._field(ribbon, 1, "기준 표"), state="disabled", width=1)
+        self.compare_comparison_table_combo = ttk.Combobox(self._field(ribbon, 2, "비교 표"), state="disabled", width=1)
+        for combo in (self.compare_reference_table_combo, self.compare_comparison_table_combo):
+            combo.grid(row=1, column=0, sticky="ew")
+            combo.bind("<<ComboboxSelected>>", self._refresh_compare_keys)
+        sources = ttk.Frame(page, padding=(16, 12))
+        sources.grid(row=1, column=0, sticky="ew")
+        for column, (title, variable, kind) in enumerate((("기준 파일", self.compare_reference_var, "reference"), ("비교 파일", self.compare_comparison_var, "comparison"))):
+            sources.columnconfigure(column, weight=1, uniform="sources")
+            card = ttk.Frame(sources)
+            card.grid(row=0, column=column, sticky="ew", padx=(0, 12) if column == 0 else 0)
+            card.columnconfigure(0, weight=1)
+            self._path_row(card, variable, lambda k=kind: self._browse_compare_input(k), title, readonly=True)
+        space = ttk.Frame(page, padding=(16, 0, 16, 12))
+        space.grid(row=2, column=0, sticky="nsew")
+        space.columnconfigure(0, weight=1)
+        space.rowconfigure(0, weight=1)
+        self.compare_position_note = ttk.Label(space, text="같은 이름의 시트에서 같은 위치의 셀 값을 비교합니다.\n다른 값은 결과 파일에 노란색으로 표시합니다.",
+                                                style="Note.TLabel", anchor="center", justify="center")
+        self.compare_position_note.grid(row=0, column=0, sticky="nsew")
+        options = self.compare_key_options = ttk.Frame(space)
+        options.grid(row=0, column=0, sticky="nsew")
+        options.columnconfigure(0, weight=1)
+        options.rowconfigure(1, weight=1)
+        tools = ttk.Frame(options)
+        tools.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.compare_tables_button = ttk.Button(tools, text="표 불러오기", command=self._load_compare_tables)
+        self.compare_tables_button.pack(side="left")
+        ttk.Label(tools, text="비교 키 · 클릭하여 여러 열 선택", style="Note.TLabel").pack(side="left", padx=10)
+        self.compare_key_count_var = tk.StringVar(value="0개 선택")
+        ttk.Label(tools, textvariable=self.compare_key_count_var, style="Note.TLabel").pack(side="right")
+        self.compare_key_list = tk.Listbox(options, selectmode="multiple", exportselection=False, height=1, activestyle="none",
+            relief="solid", borderwidth=1, highlightthickness=0, selectbackground="#edf3fc", selectforeground="#1b60bc")
+        self.compare_key_list.grid(row=1, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(options, orient="vertical", command=self.compare_key_list.yview)
+        vertical.grid(row=1, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(options, orient="horizontal", command=self.compare_key_list.xview)
+        horizontal.grid(row=2, column=0, sticky="ew")
+        self.compare_key_list.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.compare_key_list.bind("<<ListboxSelect>>", lambda _: self._render_compare_state())
+        self._input_widgets.extend((self.compare_position_radio, self.compare_key_radio, self.compare_tables_button,
+                                    self.compare_reference_table_combo, self.compare_comparison_table_combo, self.compare_key_list))
+        self._work_footer(page, "compare", "비교 시작", self._compare, self.compare_output_var, self._browse_compare_output)
+
+    def _build_etc(self):
+        page = self._page("시트 정리", "etc")
         self.etc_source_var, self.etc_sheet_var, self.etc_output_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
-        self.etc_remove_artifacts_var = tk.BooleanVar(value=False)
-        self.etc_reset_fill_var = tk.BooleanVar(value=False)
-        self.etc_exclude_table_headers_var = tk.BooleanVar(value=True)
-        self.etc_remove_conditional_formats_var = tk.BooleanVar(value=False)
-        body = self._section(page, 0, "1   파일")
-        self._path_row(body, self.etc_source_var, self._browse_etc_source, "원본 파일", readonly=True)
-        body = self._section(page, 1, "2   작업 설정")
-        ttk.Label(body, text="워크시트").grid(sticky="w")
-        self.etc_sheet_combo = ttk.Combobox(body, textvariable=self.etc_sheet_var, state="disabled")
-        self.etc_sheet_combo.grid(sticky="ew", pady=6)
+        self.etc_remove_artifacts_var, self.etc_reset_fill_var = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
+        self.etc_exclude_table_headers_var, self.etc_remove_conditional_formats_var = tk.BooleanVar(value=True), tk.BooleanVar(value=False)
+        ribbon = self._ribbon(page)
+        ribbon.columnconfigure(1, weight=1)
+        sheet = ttk.Frame(ribbon, style="Shell.TFrame")
+        sheet.grid(row=0, column=0, sticky="nw", padx=(0, 22))
+        ttk.Label(sheet, text="워크시트", style="Shell.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.etc_sheet_combo = ttk.Combobox(sheet, textvariable=self.etc_sheet_var, state="disabled", width=18)
+        self.etc_sheet_combo.grid(row=1, column=0, sticky="ew")
         self.etc_sheet_combo.bind("<<ComboboxSelected>>", lambda _: self._render_etc_state())
-        self.etc_remove_artifacts_checkbox = ttk.Checkbutton(body, text="도형·메모·댓글 삭제 (그림, 차트, 버튼 포함)",
-            variable=self.etc_remove_artifacts_var, command=self._render_etc_state)
-        self.etc_remove_artifacts_checkbox.grid(sticky="w", pady=6)
-        fill = ttk.Frame(body)
-        fill.grid(sticky="w", pady=6)
-        self.etc_reset_fill_checkbox = ttk.Checkbutton(fill, text="채우기 색 초기화", variable=self.etc_reset_fill_var, command=self._render_etc_state)
-        self.etc_reset_fill_checkbox.grid(row=0, column=0, sticky="w")
-        self.etc_exclude_table_headers_checkbox = ttk.Checkbutton(fill, text="테이블 헤더 제외", variable=self.etc_exclude_table_headers_var, command=self._render_etc_state)
-        self.etc_exclude_table_headers_checkbox.grid(row=0, column=1, sticky="w", padx=16)
-        self.etc_remove_conditional_formats_checkbox = ttk.Checkbutton(fill, text="조건부 서식 삭제", variable=self.etc_remove_conditional_formats_var, command=self._render_etc_state)
-        self.etc_remove_conditional_formats_checkbox.grid(row=1, column=0, sticky="w", pady=(12, 0))
-        ttk.Label(body, text="채우기 색은 직접 지정한 색만 초기화합니다. 조건부 서식 삭제는 헤더를 포함한 시트 전체에 적용합니다.",
-                  style="Note.TLabel", wraplength=850).grid(sticky="w", pady=(6, 0))
+        options = ttk.Frame(ribbon, style="Shell.TFrame")
+        options.grid(row=0, column=1, sticky="ew")
+        self.etc_remove_artifacts_checkbox = ttk.Checkbutton(options, text="도형·메모·댓글 삭제", variable=self.etc_remove_artifacts_var, command=self._render_etc_state)
+        self.etc_reset_fill_checkbox = ttk.Checkbutton(options, text="채우기 색 초기화", variable=self.etc_reset_fill_var, command=self._render_etc_state)
+        self.etc_exclude_table_headers_checkbox = ttk.Checkbutton(options, text="표 머리글 제외", variable=self.etc_exclude_table_headers_var, command=self._render_etc_state)
+        self.etc_remove_conditional_formats_checkbox = ttk.Checkbutton(options, text="조건부 서식 삭제", variable=self.etc_remove_conditional_formats_var, command=self._render_etc_state)
+        self.etc_remove_artifacts_checkbox.grid(row=0, column=0, sticky="w", padx=(0, 18), pady=3)
+        self.etc_reset_fill_checkbox.grid(row=0, column=1, sticky="w", padx=(0, 18), pady=3)
+        self.etc_exclude_table_headers_checkbox.grid(row=0, column=2, sticky="w", pady=3)
+        self.etc_remove_conditional_formats_checkbox.grid(row=1, column=0, sticky="w", pady=3)
+        source = ttk.Frame(page, padding=(16, 12))
+        source.grid(row=1, column=0, sticky="ew")
+        source.columnconfigure(0, weight=1)
+        self._path_row(source, self.etc_source_var, self._browse_etc_source, "원본 파일", readonly=True)
+        ttk.Label(page, text="선택한 시트만 정리하고 새 파일로 저장합니다.\n\n도형 삭제에는 그림·차트·버튼이 포함됩니다.\n조건부 서식 삭제는 머리글을 포함한 시트 전체에 적용됩니다.",
+                  style="Note.TLabel", justify="center", anchor="center").grid(row=2, column=0, sticky="nsew", padx=16, pady=12)
         self._input_widgets.extend((self.etc_sheet_combo, self.etc_remove_artifacts_checkbox, self.etc_reset_fill_checkbox,
                                     self.etc_exclude_table_headers_checkbox, self.etc_remove_conditional_formats_checkbox))
-        self._output_section(page, "etc", self.etc_output_var, self._browse_etc_output)
-        self._work_footer(page, "etc", "정리 시작", self._run_etc)
+        self._work_footer(page, "etc", "정리 시작", self._run_etc, self.etc_output_var, self._browse_etc_output)
 
     def _build_error_panel(self):
-        self.error_panel = ttk.Frame(self.root, padding=(20, 10))
-        self.error_panel.grid(row=2, column=0, sticky="ew")
+        self.error_panel = ttk.Frame(self.root, padding=(16, 5))
+        self.error_panel.grid(row=3, column=0, sticky="ew")
         self.error_panel.columnconfigure(0, weight=1)
         self.error_message_var = tk.StringVar()
-        self._wrapped_label(self.error_panel, textvariable=self.error_message_var, foreground="#a3372b").grid(row=0, column=0, sticky="ew")
-        actions = ttk.Frame(self.error_panel)
-        actions.grid(row=1, column=0, sticky="w", pady=6)
-        for i, (label, action) in enumerate((("상세 내용", self._toggle_error_detail), ("오류 복사", self._copy_error),
-                                            ("로그 폴더 열기", lambda: self._open_path(_log_path(self.logger).parent)))):
-            ttk.Button(actions, text=label, command=action).grid(row=0, column=i, padx=(0, 6))
-        self.error_text = tk.Text(self.error_panel, height=4, wrap="word", state="disabled")
-        self.error_text.grid(row=2, column=0, sticky="ew")
-        self.error_text.grid_remove()
+        ttk.Label(self.error_panel, textvariable=self.error_message_var, width=1, foreground="#a3372b").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(self.error_panel, text="오류 상세", command=self._toggle_error_detail).grid(row=0, column=1)
+        ttk.Button(self.error_panel, text="오류 복사", command=self._copy_error).grid(row=0, column=2, padx=(6, 0))
+        self.error_text = tk.Text(self.error_panel, state="disabled")
         self.error_panel.grid_remove()
 
     def _render_etc_state(self) -> None:
@@ -375,7 +445,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             state="normal" if self.etc_reset_fill_var.get() and not self._busy else "disabled",
         )
         self.etc_sheet_combo.configure(state="readonly" if self.etc_sheet_combo["values"] and not self._busy else "disabled")
-        self.etc_button.configure(state="normal" if ready and not self._busy else "disabled")
+        self.etc_button.configure(state="normal" if (ready or "etc" in self._result_visible) and not self._busy else "disabled")
 
     def _browse_etc_source(self) -> None:
         selected = filedialog.askopenfilename(parent=self.root, title="정리할 Excel 파일 선택",
@@ -418,64 +488,24 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
             progress=lambda completed, total, label: self.events.put(("progress", completed, total, label)),
         )), execution=True)
 
-    def _build_compare(self) -> None:
-        page = self._page("변경 비교")
-        self.compare_reference_var, self.compare_comparison_var, self.compare_output_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
-        body = self._section(page, 0, "1   파일")
-        body.columnconfigure((0, 1), weight=1)
-        for col, (label, variable, kind) in enumerate((("기준 파일", self.compare_reference_var, "reference"), ("비교대상 파일", self.compare_comparison_var, "comparison"))):
-            card = ttk.Frame(body, padding=10, relief="solid", borderwidth=1)
-            card.grid(row=0, column=col, sticky="ew", padx=(0, 8) if col == 0 else (0, 0))
-            card.columnconfigure(0, weight=1)
-            self._path_row(card, variable, lambda k=kind: self._browse_compare_input(k), label, readonly=True)
-        body = self._section(page, 1, "2   작업 설정")
-        modes = ttk.Frame(body)
-        modes.grid(row=0, column=0, sticky="ew")
-        modes.columnconfigure((0, 1), weight=1)
-        self.compare_by_key_var = tk.BooleanVar(value=False)
-        for col, (name, description, value, attr) in enumerate((
-            ("셀 위치로 비교", "같은 시트·행·열의 값을 비교합니다.", False, "compare_position_radio"),
-            ("키가 같은 행 비교", "행 순서가 달라도 선택한 키로 찾습니다.", True, "compare_key_radio"),
-        )):
-            card = ttk.Frame(modes, padding=10, relief="solid", borderwidth=1)
-            card.grid(row=0, column=col, sticky="ew", padx=(0, 8) if col == 0 else (0, 0))
-            radio = ttk.Radiobutton(card, text=name, variable=self.compare_by_key_var, value=value, command=self._compare_mode_changed)
-            radio.grid(sticky="w")
-            ttk.Label(card, text=description, style="Note.TLabel").grid(sticky="w", padx=(22, 0), pady=(5, 0))
-            setattr(self, attr, radio)
-            self._input_widgets.append(radio)
-        options = self.compare_key_options = ttk.Frame(body)
-        options.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        options.columnconfigure((0, 1), weight=1)
-        self.compare_tables_button = ttk.Button(options, text="표 불러오기", command=self._load_compare_tables)
-        self.compare_tables_button.grid(row=0, column=1, sticky="e", pady=(0, 8))
-        self.compare_reference_table_combo = ttk.Combobox(options, state="disabled")
-        self.compare_comparison_table_combo = ttk.Combobox(options, state="disabled")
-        for col, (label, combo) in enumerate((("기준 표", self.compare_reference_table_combo), ("비교대상 표", self.compare_comparison_table_combo))):
-            ttk.Label(options, text=label).grid(row=1, column=col, sticky="w")
-            combo.grid(row=2, column=col, sticky="ew", padx=(0, 8) if col == 0 else (0, 0), pady=5)
-            combo.bind("<<ComboboxSelected>>", self._refresh_compare_keys)
-        ttk.Label(options, text="키 컬럼 · 여러 개 선택할 수 있습니다", style="Note.TLabel").grid(row=3, column=0, columnspan=2, sticky="w")
-        self.compare_key_list = tk.Listbox(options, selectmode="multiple", exportselection=False, height=3, relief="solid", borderwidth=1)
-        self.compare_key_list.grid(row=4, column=0, columnspan=2, sticky="ew", pady=5)
-        bar = ttk.Scrollbar(options, orient="vertical", command=self.compare_key_list.yview)
-        bar.grid(row=4, column=2, sticky="ns")
-        self.compare_key_list.configure(yscrollcommand=bar.set)
-        self.compare_key_list.bind("<<ListboxSelect>>", lambda _: self._render_compare_state())
-        self._input_widgets.extend((self.compare_tables_button, self.compare_reference_table_combo, self.compare_comparison_table_combo, self.compare_key_list))
-        self._output_section(page, "compare", self.compare_output_var, self._browse_compare_output)
-        self._work_footer(page, "compare", "비교 시작", self._compare)
-
     def _render_compare_state(self) -> None:
         error = self._output_error("compare", (self.compare_reference_var.get(), self.compare_comparison_var.get()))
         ready = all(variable.get() for variable in (
             self.compare_reference_var, self.compare_comparison_var, self.compare_output_var,
         ))
         key_mode = self.compare_by_key_var.get()
+        for combo in (self.compare_reference_table_combo, self.compare_comparison_table_combo):
+            if key_mode:
+                combo.master.grid()
+            else:
+                combo.master.grid_remove()
         if key_mode:
             self.compare_key_options.grid()
+            self.compare_position_note.grid_remove()
         else:
             self.compare_key_options.grid_remove()
+            self.compare_position_note.grid()
+        self.compare_key_count_var.set(f"{len(self.compare_key_list.curselection())}개 선택")
         enabled = key_mode and not self._busy
         has_sources = bool(self.compare_reference_var.get() and self.compare_comparison_var.get())
         self.compare_tables_button.configure(state="normal" if enabled and has_sources else "disabled")
@@ -487,7 +517,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.compare_reason_var.set("작업 중에는 설정을 바꿀 수 없습니다." if self._busy else
                                     error or ("" if ready else "기준·비교대상 파일을 선택하고, 키 비교라면 표와 키를 선택하세요."))
         ready = ready and not error
-        self.compare_button.configure(state="normal" if ready and not self._busy else "disabled")
+        self.compare_button.configure(state="normal" if (ready or "compare" in self._result_visible) and not self._busy else "disabled")
 
     def _compare_mode_changed(self) -> None:
         self.compare_status_var.set("표·컬럼을 불러온 뒤 키 컬럼을 클릭하여 선택하세요." if self.compare_by_key_var.get()
@@ -575,7 +605,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self.merge_reason_var.set("작업 중에는 설정을 바꿀 수 없습니다." if self._busy else
                                   error or ("시작하면 파일을 검사하고 병합합니다." if ready else "파일 두 개 이상을 추가하세요."))
         ready = ready and not error
-        self.merge_button.configure(state="normal" if ready and not self._busy else "disabled")
+        self.merge_button.configure(state="normal" if (ready or "merge" in self._result_visible) and not self._busy else "disabled")
         self._merge_selection_changed()
 
     def _merge_selection_changed(self, _event=None) -> None:
@@ -595,7 +625,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         error = validate_output_path(value, sources=sources, allow_existing=kind == "merge")
         note = error or "원본을 유지하고 결과를 새 파일로 저장합니다."
         if not error and self.result_paths.get(kind):
-            note = "다음 실행에 사용할 파일명입니다. 저장된 파일은 아래 결과 패널에서 여세요."
+            note = "다음 실행에 사용할 파일명입니다. 저장된 파일은 실행 결과에서 여세요."
         if not error and kind == "merge" and Path(value).exists():
             note = "기존 결과 파일입니다. 병합 전에 덮어쓰기를 확인합니다. 새 이름을 권장합니다."
         getattr(self, kind + "_path_note").set(note)
@@ -626,6 +656,7 @@ class ExcelFileToolkitGui(ExcelSplitterGui):
         self._invalidate_compare_tables()
         self.compare_output_var.set(str(suggest_output_path(path.with_name(path.stem + "_비교결과.xlsx"))))
         self.notebook.select(2)
+        self._show_editor("compare")
         self.compare_status_var.set("병합 결과를 비교대상으로 넣었습니다. 기준 파일과 비교 방식을 확인하세요.")
         self._render_compare_state()
 

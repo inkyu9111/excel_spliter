@@ -83,6 +83,7 @@ def test_one_click_merge_preserves_order_without_manual_preview_or_confirmation(
     assert calls[1][0].row_count == 4
     assert gui.result_paths["merge"] == (calls[0][1],)
     assert str(gui.merge_button["state"]) == "normal"
+    gui.result_back_buttons["merge"].invoke()
     gui.merge_tree.selection_set("0")
     gui._remove_merge_file()
     assert gui.merge_preview is None
@@ -119,9 +120,10 @@ def test_one_click_split_inspects_confirms_and_executes_current_settings(toolkit
     plan = Preview(snapshot, (OutputTarget(key, "서울", target, None),), ())
     stages = []
 
-    def inspect(*args):
+    def inspect(*args, office_prefix=False):
         stages.append("inspect")
         assert args == (source, "Data", "지역", "%_최신", tmp_path)
+        assert not office_prefix
         return plan
 
     def execute(actual, overwrite, progress):
@@ -235,7 +237,7 @@ def test_compare_selection_creates_unused_output_and_saves_result(toolkit, monke
     assert gui.notebook.tab(0, "state") == gui.notebook.tab(1, "state") == "disabled"
     assert str(gui.compare_button["state"]) == "disabled"
     complete_worker(gui)
-    summary = gui.result_panels["compare"][1]["text"]
+    summary = gui.result_summaries["compare"]
     assert str(output) in summary and "3" in summary and "누락 시트" in summary
     assert messages == []
     assert gui.notebook.tab(0, "state") == gui.notebook.tab(1, "state") == "normal"
@@ -299,7 +301,7 @@ def test_key_compare_loads_tables_selects_multiple_columns_and_sends_options(too
     monkeypatch.setattr("excel_splitter.toolkit_gui.messagebox.showinfo", lambda _, text, **__: messages.append(text))
     gui._compare()
     complete_worker(gui)
-    summary = gui.result_panels["compare"][1]["text"]
+    summary = gui.result_summaries["compare"]
     assert "3" in summary and "old_amount" in summary
     assert messages == []
 
@@ -372,7 +374,7 @@ def test_etc_loads_sheets_and_saves_selected_operations_to_new_file(toolkit, mon
     assert str(gui.etc_button["state"]) == "disabled"
     complete_worker(gui)
     assert calls == [(source, "Clean", output, True, True, True, False)]
-    assert str(output) in gui.result_panels["etc"][1]["text"]
+    assert str(output) in gui.result_summaries["etc"]
     assert messages == []
     assert all(gui.notebook.tab(index, "state") == "normal" for index in range(3))
 
@@ -540,12 +542,18 @@ def test_output_entries_update_readiness_and_busy_state(toolkit, tmp_path):
 def test_position_mode_hides_keys_and_radio_switch_shows_them(toolkit):
     gui, _ = toolkit
     assert not gui.compare_key_options.winfo_manager()
+    assert not gui.compare_reference_table_combo.master.winfo_manager()
+    assert not gui.compare_comparison_table_combo.master.winfo_manager()
     gui.compare_key_radio.invoke()
     assert gui.compare_by_key_var.get()
     assert gui.compare_key_options.winfo_manager() == "grid"
+    assert gui.compare_reference_table_combo.master.winfo_manager() == "grid"
+    assert gui.compare_comparison_table_combo.master.winfo_manager() == "grid"
     gui.compare_position_radio.invoke()
     assert not gui.compare_by_key_var.get()
     assert not gui.compare_key_options.winfo_manager()
+    assert not gui.compare_reference_table_combo.master.winfo_manager()
+    assert not gui.compare_comparison_table_combo.master.winfo_manager()
 
 
 def test_output_validation_rejects_original_existing_and_missing_parent(toolkit, tmp_path):
@@ -697,7 +705,7 @@ def test_compare_details_keep_keys_and_both_coordinates_and_full_counts(toolkit,
                            details=(detail,), details_truncated=True, omitted_details=4)
     gui._handle_ok(("compare_execute", result))
     frame, label, tree, _ = gui.result_panels["compare"]
-    text = label["text"]
+    text = gui.result_summaries["compare"]
     assert "값 변경 1셀" in text and "추가 3행" in text and "누락 2행" in text and "4건" in text
     row = tree.item(tree.get_children()[0], "values")
     assert all(value in row[1] for value in ("id=A-1", "B2", "E4"))
@@ -764,7 +772,7 @@ def _widgets(parent):
         yield from _widgets(child)
 
 
-def test_long_paths_are_wrapped_in_full_without_squeezing_input_controls(toolkit, tmp_path):
+def test_long_paths_keep_the_ribbon_fixed_and_open_in_a_detail_window(toolkit, tmp_path):
     from tkinter import ttk
 
     gui, _ = toolkit
@@ -772,21 +780,25 @@ def test_long_paths_are_wrapped_in_full_without_squeezing_input_controls(toolkit
     gui.compare_reference_var.set(path)
     gui.compare_comparison_var.set(path)
     gui.notebook.select(2)
-    gui.root.geometry("900x680")
+    gui.root.geometry("900x600")
     gui.root.deiconify()
     gui.root.update()
     try:
-        labels = [widget for widget in _widgets(gui.root) if isinstance(widget, ttk.Label)
-                  and str(widget.cget("textvariable")) == str(gui.compare_reference_var)]
-        assert labels, "Long paths need a full wrapped display beside the scrollable entry"
-        label = labels[0]
-        assert label.winfo_manager() == "grid"
-        assert gui.root.getvar(str(label.cget("textvariable"))) == path
-        assert float(label.cget("wraplength")) <= label.winfo_width()
         entries = [widget for widget in _widgets(gui.root) if isinstance(widget, ttk.Entry)
                    and str(widget.cget("textvariable")) == str(gui.compare_reference_var)]
+        assert entries[0].get() == path
         assert entries[0].winfo_width() >= 200
         assert entries[0].winfo_rootx() + entries[0].winfo_width() < gui.root.winfo_rootx() + gui.root.winfo_width()
+        details = next(widget for widget in entries[0].master.winfo_children()
+                       if isinstance(widget, ttk.Button) and widget["text"] == "경로")
+        details.invoke()
+        window = next(widget for widget in gui.root.winfo_children() if isinstance(widget, tk.Toplevel))
+        try:
+            text = next(widget for widget in window.winfo_children() if isinstance(widget, tk.Text))
+            assert text.get("1.0", "end-1c") == path
+        finally:
+            window.destroy()
+        assert gui.root.winfo_height() == 600
     finally:
         gui.root.withdraw()
 
@@ -800,15 +812,15 @@ def test_merge_selection_exposes_full_path_in_compact_window(toolkit, tmp_path):
     gui._invalidate_merge_preview()
     gui.merge_tree.selection_set("1")
     gui.merge_tree.event_generate("<<TreeviewSelect>>")
-    gui.root.geometry("900x680")
+    gui.root.geometry("900x600")
     gui.root.deiconify()
     gui.root.update()
     try:
         labels = [widget for widget in _widgets(gui.root) if isinstance(widget, ttk.Label)
                   and widget.cget("textvariable")
                   and gui.root.getvar(str(widget.cget("textvariable"))) == str(paths[1])]
-        assert labels, "The selected merge input must be readable without truncation"
-        assert float(labels[0].cget("wraplength")) <= labels[0].winfo_width()
+        assert labels, "The selected merge input must retain its full path"
+        assert not labels[0].cget("wraplength")
         assert gui.merge_tree.cget("xscrollcommand")
     finally:
         gui.root.withdraw()
@@ -847,12 +859,12 @@ def test_merge_multiple_selection_and_delete_are_safe_during_work(toolkit, monke
 
 
 @pytest.mark.parametrize("tab,kind", enumerate(("split", "merge", "compare", "etc")))
-def test_primary_action_stays_visible_when_settings_scroll(toolkit, tab, kind):
+def test_all_ribbon_controls_fit_without_outer_scrolling(toolkit, tab, kind):
     gui, _ = toolkit
     gui.notebook.select(tab)
     gui.compare_by_key_var.set(True)
     gui._compare_mode_changed()
-    gui.root.geometry("760x540")
+    gui.root.geometry("900x600")
     gui.root.deiconify()
     gui.root.update()
     try:
@@ -860,8 +872,88 @@ def test_primary_action_stays_visible_when_settings_scroll(toolkit, tab, kind):
         assert button.winfo_ismapped()
         assert button.winfo_rooty() + button.winfo_height() <= gui.root.winfo_rooty() + gui.root.winfo_height()
         assert button.winfo_rootx() + button.winfo_width() <= gui.root.winfo_rootx() + gui.root.winfo_width()
+        assert gui.root.winfo_width() == 900 and gui.root.winfo_height() == 600
+        assert not any(isinstance(widget, tk.Canvas) for widget in _widgets(gui.root))
+        controls = {
+            "split": (gui.source_entry, gui.sheet_combo, gui.column_combo, gui.pattern_entry, gui.split_office_prefix_checkbox, gui.output_entry),
+            "merge": (*gui.merge_list_buttons, gui.merge_tree, gui.merge_output_entry),
+            "compare": (gui.compare_key_radio, gui.compare_reference_table_combo, gui.compare_comparison_table_combo,
+                        gui.compare_tables_button, gui.compare_key_list, gui.compare_output_entry),
+            "etc": (gui.etc_sheet_combo, gui.etc_remove_artifacts_checkbox, gui.etc_reset_fill_checkbox,
+                    gui.etc_exclude_table_headers_checkbox, gui.etc_remove_conditional_formats_checkbox, gui.etc_output_entry),
+        }[kind]
+        for control in controls:
+            assert control.winfo_ismapped(), control
+            assert control.winfo_rootx() >= gui.root.winfo_rootx()
+            assert control.winfo_rootx() + control.winfo_width() <= gui.root.winfo_rootx() + 900, control
+            assert control.winfo_rooty() + control.winfo_height() <= gui.root.winfo_rooty() + 600, control
     finally:
         gui.root.withdraw()
+
+
+def test_result_replaces_editor_and_large_lists_stay_inside_the_workspace(toolkit, tmp_path):
+    gui, _ = toolkit
+    gui.nav_buttons["compare"].invoke()
+    gui.compare_by_key_var.set(True)
+    columns = tuple(f"컬럼 {index}" for index in range(200))
+    tables = ((SimpleNamespace(sheet_name="Data", table_name="Table1", columns=columns),),) * 2
+    gui._handle_ok(("compare_tables", tables))
+    gui.compare_key_list.selection_set(0)
+    gui._render_compare_state()
+    gui.root.geometry("900x600")
+    gui.root.deiconify()
+    gui.root.update()
+    try:
+        assert gui.compare_key_list.size() == 200
+        assert gui.compare_key_list.yview()[1] < 1
+        summary = "비교 완료 · 1,000건\n" + "긴 결과 설명\n" * 100
+        gui._show_result("compare", (tmp_path / "result.xlsx",), summary,
+                         [("값 변경", str(index), "금액", "1", "2") for index in range(1000)])
+        gui.root.update()
+        frame, label, tree, _ = gui.result_panels["compare"]
+        assert not gui._edit_areas["compare"].winfo_ismapped()
+        assert frame.winfo_ismapped() and tree.winfo_height() >= 200
+        assert len(tree.get_children()) == 1000 and tree.yview()[1] < 1
+        assert "\n" not in label["text"] and summary in gui.result_summaries["compare"]
+        assert gui.root.winfo_height() == 600 and gui.compare_button["text"] == "새 작업"
+        gui.result_back_buttons["compare"].invoke()
+        gui.root.update()
+        assert not frame.winfo_ismapped() and gui._edit_areas["compare"].winfo_ismapped()
+        assert gui.compare_key_list.curselection() == (0,)
+        assert gui.compare_button["text"] == "비교 시작"
+    finally:
+        gui.root.withdraw()
+
+
+def test_office_prefix_is_enabled_only_after_column_check_and_resets_on_change(toolkit, tmp_path):
+    gui, _ = toolkit
+    gui.nav_buttons["split"].invoke()
+    checked = []
+    def inspect(source, sheet, column):
+        checked.append((source, sheet, column))
+        return column == "사업소"
+    gui.controller._service = SimpleNamespace(office_prefix_available=inspect, shutdown=lambda: None)
+    source = tmp_path / "source.xlsx"
+    gui.controller.state = replace(gui.controller.state, source=source, sheets=("Data",), sheet_name="Data",
+                                   columns=("사업소", "기타"), output_dir=tmp_path)
+    gui._render_state(gui.controller.state)
+    assert gui.split_office_prefix_checkbox.instate(["disabled"])
+    gui.column_combo.set("사업소")
+    gui._select_column()
+    assert gui._busy and gui.split_office_prefix_checkbox.instate(["disabled"])
+    complete_worker(gui)
+    assert checked == [(source, "Data", "사업소")]
+    assert not gui.split_office_prefix_checkbox.instate(["disabled"])
+    gui.split_office_prefix_checkbox.invoke()
+    assert gui.controller.state.office_prefix and gui.split_office_prefix_var.get()
+    gui.pattern_var.set("%_보고서")
+    assert gui.controller.state.office_prefix, "Changing the filename pattern must retain an eligible option"
+    gui.column_combo.set("기타")
+    gui._select_column()
+    assert not gui.split_office_prefix_var.get() and gui.split_office_prefix_checkbox.instate(["disabled"])
+    complete_worker(gui)
+    assert not gui.controller.state.office_prefix_available and not gui.controller.state.office_prefix
+    assert gui.split_office_prefix_checkbox.instate(["disabled"])
 
 
 def test_pasting_split_pattern_invalidates_preview_without_key_release(toolkit, tmp_path):

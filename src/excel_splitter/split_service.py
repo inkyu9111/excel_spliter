@@ -6,8 +6,8 @@ from pathlib import Path
 
 from .errors import WorkbookValidationError
 from .file_signature import capture_signature
-from .models import Preview, SplitResult, TableInfo
-from .naming import build_targets
+from .models import Preview, SplitResult, TableInfo, WorkbookSnapshot
+from .naming import build_targets, office_prefix_available as can_prefix_offices
 from .ports import ExcelGatewayPort, ProgressCallback
 
 
@@ -17,13 +17,35 @@ _MAX_ABSOLUTE_PATH_LENGTH = 218
 class SplitService:
     def __init__(self, gateway: ExcelGatewayPort) -> None:
         self.gateway = gateway
+        self._column_snapshot: WorkbookSnapshot | None = None
 
     def list_sheets(self, source: Path) -> tuple[str, ...]:
+        self._column_snapshot = None
         _validate_source_path(source)
         return self.gateway.list_worksheets(source)
 
     def inspect_sheet(self, source: Path, sheet_name: str) -> TableInfo:
+        self._column_snapshot = None
         return self.gateway.inspect_table(source, sheet_name)
+
+    def _snapshot(self, source: Path, sheet_name: str, column_name: str) -> WorkbookSnapshot:
+        cached = self._column_snapshot
+        self._column_snapshot = None
+        _validate_source_path(source)
+        signature = capture_signature(source)
+        if cached is not None and (
+            cached.source, cached.sheet_name, cached.column_name, cached.signature
+        ) == (source, sheet_name, column_name, signature):
+            self._column_snapshot = cached
+            return cached
+        snapshot = self.gateway.build_snapshot(source, sheet_name, column_name)
+        if snapshot.signature != signature or capture_signature(source) != signature:
+            raise WorkbookValidationError("분류 값을 확인하는 동안 원본이 변경되었습니다. 파일을 다시 선택하세요.")
+        self._column_snapshot = snapshot
+        return snapshot
+
+    def office_prefix_available(self, source: Path, sheet_name: str, column_name: str) -> bool:
+        return can_prefix_offices(self._snapshot(source, sheet_name, column_name).groups)
 
     def preview(
         self,
@@ -32,11 +54,12 @@ class SplitService:
         column_name: str,
         pattern: str,
         output_dir: Path,
+        office_prefix: bool = False,
     ) -> Preview:
         _validate_source_path(source)
         _validate_output_dir(output_dir)
-        snapshot = self.gateway.build_snapshot(source, sheet_name, column_name)
-        targets = build_targets(pattern, snapshot.groups, output_dir, source)
+        snapshot = self._snapshot(source, sheet_name, column_name)
+        targets = build_targets(pattern, snapshot.groups, output_dir, source, office_prefix=office_prefix)
         signed = tuple(
             replace(
                 target,
@@ -60,6 +83,7 @@ class SplitService:
         overwrite: bool,
         progress: ProgressCallback,
     ) -> SplitResult:
+        self._column_snapshot = None
         progress(0, 0, "원본 확인 중")
         if capture_signature(preview.snapshot.source) != preview.snapshot.signature:
             raise WorkbookValidationError(
@@ -71,6 +95,7 @@ class SplitService:
         return self.gateway.write_groups(preview.snapshot, preview.targets, progress)
 
     def shutdown(self) -> None:
+        self._column_snapshot = None
         self.gateway.shutdown()
 
 

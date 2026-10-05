@@ -186,6 +186,7 @@ class ExcelSplitterGui:
         )
         if not selected:
             return
+        self._reset_office_prefix()
         self.source_var.set(selected)
         self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
@@ -195,12 +196,27 @@ class ExcelSplitterGui:
 
     def _select_sheet(self, _event: object = None) -> None:
         name = self.sheet_var.get()
+        self._reset_office_prefix()
         self.controller.set_pattern(self.pattern_var.get())
         self._clear_preview()
         self._start_worker(lambda: ("sheet", self.controller.select_sheet(name)))
 
     def _select_column(self, _event: object = None) -> None:
-        self.controller.select_column(self.column_var.get())
+        if self._busy:
+            return
+        name = self.column_var.get()
+        self._reset_office_prefix()
+        self._clear_preview()
+        self._start_worker(lambda: ("column", self.controller.select_column(name)))
+        self._phase = "분류값과 사업소 목록 확인 중"
+
+    def _reset_office_prefix(self) -> None:
+        if hasattr(self, "split_office_prefix_var"):
+            self.split_office_prefix_var.set(False)
+            self.split_office_prefix_checkbox.configure(state="disabled")
+
+    def _office_prefix_changed(self) -> None:
+        self.controller.set_office_prefix(self.split_office_prefix_var.get())
         self._clear_preview()
         self._render_state(self.controller.state)
 
@@ -323,7 +339,7 @@ class ExcelSplitterGui:
     def _handle_ok(self, payload: object) -> None:
         self._set_busy(False)
         tag, value = payload
-        if tag in {"source", "sheet"}:
+        if tag in {"source", "sheet", "column"}:
             self._clear_preview()
             self._render_state(value)
             self.status_var.set("다음 항목을 선택하세요.")
@@ -449,8 +465,6 @@ class ExcelSplitterGui:
     def _clear_preview(self) -> None:
         for item in self.preview_tree.get_children():
             self.preview_tree.delete(item)
-        if hasattr(self, "split_path_note"):
-            self.preview_tree.master.grid_remove()
         self.split_button.configure(state="disabled")
 
     def _render_state(self, state: UiState) -> None:
@@ -465,6 +479,11 @@ class ExcelSplitterGui:
         self.pattern_var.set(state.pattern)
         if self._busy:
             return
+        if hasattr(self, "split_office_prefix_var"):
+            self.split_office_prefix_var.set(state.office_prefix)
+            self.split_office_prefix_checkbox.configure(state="normal" if state.office_prefix_available else "disabled")
+            self.split_office_note.set("기준 15개 사업소 확인 완료" if state.office_prefix_available else
+                                       "기준 15개 사업소와 모두 일치할 때 사용")
         self.sheet_combo.configure(state="readonly" if state.sheets else "disabled")
         self.column_combo.configure(state="readonly" if state.columns else "disabled")
         self.pattern_entry.configure(state="normal" if state.source else "disabled")
@@ -530,19 +549,20 @@ class ExcelSplitterGui:
     def _show_result(self, kind: str, paths: tuple[Path, ...], summary: str, rows=()) -> None:
         self.result_paths[kind] = paths
         frame, label, tree, buttons = self.result_panels[kind]
-        label.configure(text=summary + (f"\n{paths[0]}" if paths else ""))
+        self.result_summaries[kind] = summary + ("\n\n" + "\n".join(map(str, paths)) if paths else "")
+        label.configure(text=summary.splitlines()[0])
         tree.delete(*tree.get_children())
+        if not rows:
+            rows = [("완료", path.name, "", "", str(path)) for path in paths]
         for row in rows:
             tree.insert("", "end", values=row)
-        if rows:
-            tree.master.grid()
-        else:
-            tree.master.grid_remove()
         for button in buttons:
             button.configure(state="normal" if paths else "disabled")
         frame.grid()
-        canvas = frame.master.master
-        self.root.after_idle(lambda: (canvas.update_idletasks(), canvas.yview_moveto(1)))
+        self._edit_areas[kind].grid_remove()
+        self._save_rows[kind].grid_remove()
+        self._result_visible.add(kind)
+        getattr(self, kind + "_button").configure(text="새 작업", state="normal")
 
     def _show_result_detail(self, kind: str):
         tree = self.result_panels[kind][2]
@@ -550,9 +570,14 @@ class ExcelSplitterGui:
         if not selection:
             return None
         values = tree.item(selection[0], "values")
+        headings = tuple(tree.heading(column, "text") for column in tree["columns"])
+        return self._show_text("선택 내역 상세 보기", "\n\n".join(f"{heading}\n{value}" for heading, value in zip(headings, values) if value))
+
+    def _show_text(self, title: str, content: str):
         window = tk.Toplevel(self.root)
-        window.title("선택 내역 상세 보기")
+        window.title(title)
         window.geometry("720x440")
+        window.minsize(400, 250)
         window.columnconfigure(0, weight=1)
         window.rowconfigure(0, weight=1)
         text = tk.Text(window, wrap="word", padx=14, pady=14)
@@ -560,16 +585,13 @@ class ExcelSplitterGui:
         bar = ttk.Scrollbar(window, orient="vertical", command=text.yview)
         bar.grid(row=0, column=1, sticky="ns")
         text.configure(yscrollcommand=bar.set)
-        headings = ("구분", "시트 · 키 / 위치", "열", "기준 파일", "대상 파일")
-        text.insert("1.0", "\n\n".join(f"{heading}\n{value}" for heading, value in zip(headings, values)))
+        text.insert("1.0", content)
         text.configure(state="disabled")
+        window.bind("<Escape>", lambda _: window.destroy())
         return window
 
     def _toggle_error_detail(self) -> None:
-        if self.error_text.winfo_manager():
-            self.error_text.grid_remove()
-        else:
-            self.error_text.grid()
+        return self._show_text("오류 상세", self.error_message_var.get() + "\n\n" + self.error_detail)
 
     def _copy_error(self) -> None:
         self.root.clipboard_clear()

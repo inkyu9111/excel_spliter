@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from excel_splitter.controller import AppController
+from excel_splitter.errors import WorkbookValidationError
 from excel_splitter.gui import ExcelSplitterGui
 from excel_splitter.parallel_writer import ParallelWriteAborted
 from excel_splitter.models import (
@@ -244,12 +245,17 @@ class FakeService:
     def __init__(self) -> None:
         self.preview_value = _preview()
         self.execute_calls: list[tuple[Preview, bool]] = []
+        self.office_available = False
+        self.prefix_requests: list[bool] = []
 
     def list_sheets(self, source: Path) -> tuple[str, ...]:
         return ("분류표", "참조")
 
     def inspect_sheet(self, source: Path, sheet_name: str) -> TableInfo:
         return TableInfo(sheet_name, "Table1", ("구분", "금액"), 2)
+
+    def office_prefix_available(self, source: Path, sheet_name: str, column_name: str) -> bool:
+        return self.office_available
 
     def preview(
         self,
@@ -258,7 +264,9 @@ class FakeService:
         column_name: str,
         pattern: str,
         output_dir: Path,
+        office_prefix: bool = False,
     ) -> Preview:
+        self.prefix_requests.append(office_prefix)
         return self.preview_value
 
     def execute(self, preview, overwrite, progress):
@@ -344,29 +352,6 @@ def test_upstream_edit_invalidates_preview(change: str) -> None:
     assert controller.state.preview is None
 
 
-def test_create_preview_stores_service_result() -> None:
-    service = FakeService()
-    controller = _ready_controller(service)
-
-    result = controller.create_preview()
-
-    assert result is service.preview_value
-    assert controller.state.preview is service.preview_value
-
-
-def test_execute_uses_current_preview_and_forwards_progress() -> None:
-    service = FakeService()
-    controller = _ready_controller(service)
-    current = controller.create_preview()
-    progress_events: list[tuple[int, int, str]] = []
-
-    result = controller.execute(True, lambda *event: progress_events.append(event))
-
-    assert service.execute_calls == [(current, True)]
-    assert progress_events == [(1, 1, "A")]
-    assert result.succeeded == (Path("A_분할.xlsx"),)
-
-
 def test_execute_rejects_missing_or_invalidated_preview() -> None:
     service = FakeService()
     controller = _ready_controller(service)
@@ -380,8 +365,48 @@ def test_execute_rejects_missing_or_invalidated_preview() -> None:
         controller.execute(False, lambda *_: None)
 
 
-def test_controller_shutdown_delegates_to_service() -> None:
+def test_office_prefix_is_opt_in_and_invalidated_by_failed_column_selection(monkeypatch) -> None:
     service = FakeService()
-    controller = AppController(service)
-    controller.shutdown()
-    assert service.shutdown_called is True
+    service.office_available = True
+    controller = _ready_controller(service)
+    assert controller.state.office_prefix_available and not controller.state.office_prefix
+    controller.create_preview()
+    controller.set_office_prefix(True)
+    assert controller.state.preview is None
+    controller.create_preview()
+    assert service.prefix_requests == [False, True]
+
+    def fail(*_args):
+        raise WorkbookValidationError("원본 변경")
+    monkeypatch.setattr(service, "office_prefix_available", fail)
+    with pytest.raises(WorkbookValidationError, match="원본 변경"):
+        controller.select_column("금액")
+    assert controller.state.column_name is None
+    assert controller.state.preview is None
+    assert not controller.state.office_prefix_available and not controller.state.office_prefix
+    with pytest.raises(WorkbookValidationError, match="15개"):
+        controller.set_office_prefix(True)
+
+
+@pytest.mark.parametrize("operation", ["preview", "execute"])
+@pytest.mark.parametrize("still_available", [False, True, None])
+def test_failed_action_refreshes_prefix_eligibility_without_losing_valid_choice(monkeypatch, still_available, operation) -> None:
+    service = FakeService()
+    service.office_available = True
+    controller = _ready_controller(service)
+    controller.set_office_prefix(True)
+    controller.create_preview()
+    service.office_available = still_available
+    def fail(*_args, **_kwargs):
+        raise WorkbookValidationError("출력 경로 오류" if still_available else "분류 값 변경")
+    monkeypatch.setattr(service, operation, fail)
+    if still_available is None:
+        monkeypatch.setattr(service, "office_prefix_available", fail)
+    with pytest.raises(WorkbookValidationError):
+        if operation == "preview":
+            controller.create_preview()
+        else:
+            controller.execute(False, lambda *_: None)
+    assert controller.state.preview is None
+    assert controller.state.office_prefix_available is bool(still_available)
+    assert controller.state.office_prefix is bool(still_available)

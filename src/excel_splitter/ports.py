@@ -27,6 +27,7 @@ class ExcelGatewayPort(Protocol):
 class SplitServicePort(Protocol):
     def list_sheets(self, source: Path) -> tuple[str, ...]: ...
     def inspect_sheet(self, source: Path, sheet_name: str) -> TableInfo: ...
+    def office_prefix_available(self, source: Path, sheet_name: str, column_name: str) -> bool: ...
     def preview(
         self,
         source: Path,
@@ -34,6 +35,7 @@ class SplitServicePort(Protocol):
         column_name: str,
         pattern: str,
         output_dir: Path,
+        office_prefix: bool = False,
     ) -> Preview: ...
     def execute(
         self, preview: Preview, overwrite: bool, progress: ProgressCallback

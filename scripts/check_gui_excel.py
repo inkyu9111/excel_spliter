@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from check_merge_excel import _new_table
+from check_split_merge_excel import OFFICES, OFFICE_ROWS, make_office_source
 from excel_splitter.controller import AppController
 from excel_splitter.excel_gateway import ExcelComGateway, _excel_session, _open_workbook
 from excel_splitter.file_signature import capture_signature
@@ -33,13 +34,24 @@ def wait_idle(root, gui):
     return updates
 
 
+def select_combo(root, gui, combo, value):
+    combo.current(tuple(combo["values"]).index(value))
+    combo.event_generate("<<ComboboxSelected>>")
+    return wait_idle(root, gui)
+
+
 def main():
-    with TemporaryDirectory(prefix="excel-toolkit-gui-") as directory:
+    scratch = Path(__file__).resolve().parents[1] / "build"
+    scratch.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="excel-toolkit-gui-", dir=scratch) as directory:
         folder = Path(directory)
         first, second, mismatch = (folder / name for name in ("서울.xlsx", "부산.xlsx", "다른_열.xlsx"))
         target = folder / "병합결과.xlsx"
         split_dir = folder / "분할 결과"
         split_dir.mkdir()
+        office_source = folder / "사업소 원본.xlsx"
+        office_dir = folder / "사업소 결과"
+        office_dir.mkdir()
         expected = (("서울", 10.0), ("부산", 20.0), ("부산", 30.0))
         with _excel_session() as excel:
             for path, headers, rows in (
@@ -49,17 +61,22 @@ def main():
             ):
                 with _new_table(excel, path, headers, rows):
                     pass
-        sources = (first, second, mismatch)
+            make_office_source(excel, office_source)
+        sources = (first, second, mismatch, office_source)
         before = tuple(capture_signature(path) for path in sources)
         root = tk.Tk()
         root.withdraw()
         gui = ExcelFileToolkitGui(root, AppController(SplitService(ExcelComGateway())))
         selected = [str(first), str(mismatch)]
+        source_selection = [str(target)]
+        folder_selection = [str(split_dir)]
+        all_outputs = {target: expected}
         try:
             with patch("excel_splitter.toolkit_gui.filedialog.askopenfilenames", side_effect=lambda **_: tuple(selected)), \
-                 patch("excel_splitter.gui.filedialog.askopenfilename", return_value=str(target)), \
-                 patch("excel_splitter.gui.filedialog.askdirectory", return_value=str(split_dir)), \
+                 patch("excel_splitter.gui.filedialog.askopenfilename", side_effect=lambda **_: source_selection[0]), \
+                 patch("excel_splitter.gui.filedialog.askdirectory", side_effect=lambda **_: folder_selection[0]), \
                  patch("excel_splitter.toolkit_gui.messagebox.askyesno", return_value=True) as confirm:
+                gui.nav_buttons["merge"].invoke()
                 gui.merge_list_buttons[0].invoke()
                 gui.merge_output_var.set(str(target))
                 gui.merge_button.invoke()
@@ -91,7 +108,7 @@ def main():
                 assert confirm.call_count == 0, "New merge output must run without a confirmation dialog"
 
                 merged_signature = capture_signature(target)
-                gui.notebook.select(0)
+                gui.nav_buttons["split"].invoke()
                 root.deiconify()
                 root.update()
                 source_picker = next(widget for widget in gui.source_entry.master.winfo_children() if isinstance(widget, ttk.Button))
@@ -99,12 +116,8 @@ def main():
                 assert gui._busy and gui.split_button.instate(["disabled"])
                 wait_idle(root, gui)
                 assert gui.controller.state.source == target, getattr(gui, "error_detail", "")
-                gui.sheet_combo.current(tuple(gui.sheet_combo["values"]).index("Data"))
-                gui.sheet_combo.event_generate("<<ComboboxSelected>>")
-                assert gui._busy
-                wait_idle(root, gui)
-                gui.column_combo.current(tuple(gui.column_combo["values"]).index("지역"))
-                gui.column_combo.event_generate("<<ComboboxSelected>>")
+                select_combo(root, gui, gui.sheet_combo, "Data")
+                select_combo(root, gui, gui.column_combo, "지역")
                 output_picker = next(widget for widget in gui.output_entry.master.winfo_children() if isinstance(widget, ttk.Button))
                 output_picker.invoke()
                 gui.pattern_entry.delete(0, "end")
@@ -125,6 +138,60 @@ def main():
                 assert not gui._progress_running and not gui._executing
                 assert confirm.call_count == 1, "Split should ask only for its destructive transformation warning"
                 assert confirm.call_args.args[0] == "분할 확인"
+                all_outputs.update(split_targets)
+
+                print("CHECK: real column selection enables numbering only for the exact 15 offices", flush=True)
+                gui.result_back_buttons["split"].invoke()
+                source_selection[0] = str(office_source)
+                source_picker.invoke()
+                wait_idle(root, gui)
+                assert gui.split_office_prefix_checkbox.instate(["disabled"])
+                assert gui.split_office_prefix_var.get() is False
+                select_combo(root, gui, gui.sheet_combo, "Data")
+                for invalid_column in ("누락", "추가", "공백", "빈셀", "오류"):
+                    select_combo(root, gui, gui.column_combo, "사업소")
+                    assert not gui.split_office_prefix_checkbox.instate(["disabled"])
+                    assert gui.split_office_prefix_var.get() is False
+                    gui.split_office_prefix_checkbox.invoke()
+                    assert gui.split_office_prefix_var.get() is True
+                    select_combo(root, gui, gui.column_combo, invalid_column)
+                    assert gui.split_office_prefix_checkbox.instate(["disabled"]), invalid_column
+                    assert gui.split_office_prefix_var.get() is False, invalid_column
+
+                select_combo(root, gui, gui.column_combo, "사업소")
+                gui.split_office_prefix_checkbox.invoke()
+                select_combo(root, gui, gui.sheet_combo, "Data")
+                assert gui.split_office_prefix_checkbox.instate(["disabled"])
+                assert gui.split_office_prefix_var.get() is False
+                select_combo(root, gui, gui.column_combo, "사업소")
+                gui.split_office_prefix_checkbox.invoke()
+                source_picker.invoke()
+                wait_idle(root, gui)
+                assert gui.split_office_prefix_checkbox.instate(["disabled"])
+                assert gui.split_office_prefix_var.get() is False
+                select_combo(root, gui, gui.sheet_combo, "Data")
+                select_combo(root, gui, gui.column_combo, "사업소")
+                assert not gui.split_office_prefix_checkbox.instate(["disabled"])
+                gui.split_office_prefix_checkbox.invoke()
+
+                folder_selection[0] = str(office_dir)
+                output_picker.invoke()
+                gui.pattern_entry.delete(0, "end")
+                gui.pattern_entry.insert(0, "사업소_%_결과")
+                assert gui.split_office_prefix_var.get() is True
+                assert not gui.split_button.instate(["disabled"])
+                print("CHECK: one-click numbered split produces all 15 exact filenames and rows", flush=True)
+                gui.split_button.invoke()
+                assert gui._busy and gui.split_office_prefix_checkbox.instate(["disabled"])
+                wait_idle(root, gui)
+                office_targets = {
+                    office_dir / f"{number:02d}_사업소_{office}_결과.xlsx": tuple(row for row in OFFICE_ROWS if row[0] == office)
+                    for number, office in enumerate(OFFICES, 1)
+                }
+                assert set(gui.result_paths.get("split", ())) == set(office_targets), getattr(gui, "error_detail", "")
+                assert set(office_dir.iterdir()) == set(office_targets)
+                assert confirm.call_count == 2, "Eligibility checks must not open execution confirmations"
+                all_outputs.update(office_targets)
         finally:
             if not gui._busy:
                 gui._on_close()
@@ -132,7 +199,7 @@ def main():
                 # The outer E2E process timeout handles a genuinely stuck native call.
                 root.destroy()
         with _excel_session() as excel:
-            for path, rows in {target: expected, **split_targets}.items():
+            for path, rows in all_outputs.items():
                 book = _open_workbook(excel, path, read_only=True)
                 try:
                     assert book.Worksheets.Count == 1
@@ -143,8 +210,8 @@ def main():
                     book = None
         assert tuple(capture_signature(path) for path in sources) == before
         assert capture_signature(target) == merged_signature
-        assert not tuple(folder.glob(".em-*"))
-    print("PASS: Tk controls → validation failure → retry → native merge → compare handoff → single-click native split", flush=True)
+        assert set(folder.rglob("*")) == {*sources, *all_outputs, split_dir, office_dir}
+    print("PASS: Tk controls → validation failure → retry → native merge → compare handoff → single-click native split; exact office eligibility, invalidation and 15 numbered outputs", flush=True)
 
 
 if __name__ == "__main__":

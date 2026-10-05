@@ -16,6 +16,19 @@ _RESERVED_NAMES = {
 }
 _UNSUPPORTED_EXTENSIONS = (".xls", ".xlsm", ".xlsb")
 _MAX_ABSOLUTE_PATH_LENGTH = 218
+OFFICE_ORDER = (
+    "서울", "남서울", "인천", "경기북부", "경기", "강원", "충북", "대전세종충남",
+    "전북", "광주전남", "대구", "경북", "부산울산", "경남", "제주",
+)
+_OFFICE_RANK = {name: index for index, name in enumerate(OFFICE_ORDER, 1)}
+
+
+def office_prefix_available(groups: tuple[GroupSummary, ...]) -> bool:
+    return (
+        len(groups) == len(OFFICE_ORDER)
+        and all(group.key.kind == "text" for group in groups)
+        and {group.key.value for group in groups} == set(OFFICE_ORDER)
+    )
 
 
 def build_targets(
@@ -23,8 +36,13 @@ def build_targets(
     groups: tuple[GroupSummary, ...],
     output_dir: Path,
     source: Path,
+    office_prefix: bool = False,
 ) -> tuple[OutputTarget, ...]:
     stem_pattern = _validate_and_strip_extension(pattern)
+    if office_prefix:
+        if not office_prefix_available(groups):
+            raise WorkbookValidationError("사업소 번호는 분류 값이 지정된 15개 사업소와 정확히 일치할 때만 사용할 수 있습니다.")
+        groups = tuple(sorted(groups, key=lambda group: _OFFICE_RANK[group.key.value]))
     source_key = _absolute_key(source)
     used_names: set[str] = set()
     targets: list[OutputTarget] = []
@@ -36,6 +54,8 @@ def build_targets(
             stem = f"_{stem}"
         if not stem:
             raise WorkbookValidationError("파일명 패턴의 결과가 비어 있습니다.")
+        if office_prefix:
+            stem = f"{_OFFICE_RANK[group.key.value]:02d}_{stem}"
 
         filename = _unique_filename(stem, used_names)
         path = output_dir / filename
